@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from urllib.parse import quote
+import aiohttp
 from miservice import MiAccount as _MiAccount
 
 CLOCK_MODEL = "zimi.clock.myk01"
@@ -56,6 +57,37 @@ def classify_qr_poll(status, raw):
 
 class MiAccount(_MiAccount):
     """2.9.3's login helper disables TLS verification; keep it enabled here."""
+    async def login(self, sid):
+        if not isinstance(self.token, dict) or not self.token.get("passToken"):
+            return await super().login(sid)
+        # QR callbacks and another SID can leave account cookies that cause a
+        # shortened serviceLogin response. Exchange passport credentials in a
+        # fresh cookie jar, retaining valid cached SIDs only for the same user.
+        original = dict(self.token)
+        self.last_login_reason = None
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                isolated = MiAccount(session, self.username, self.password, None)
+                isolated.token = {k: original.get(k, "") for k in ("passToken", "userId", "deviceId")}
+                if not await _MiAccount.login(isolated, sid):
+                    self.last_login_reason = "passport_exchange_rejected"
+                    return False
+                token = isolated.token
+                pair = (token or {}).get(sid)
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(pair):
+                    self.last_login_reason = "service_token_missing"
+                    return False
+            self.token = ({**original, **token} if str(token.get("userId")) == str(original.get("userId"))
+                          else dict(token))
+            remember_secrets(self.token)
+            if self.token_store:
+                self.token_store.save_token(self.token)
+            return True
+        except Exception:
+            self.token = original
+            self.last_login_reason = "passport_exchange_error"
+            return False
+
     async def _serviceLogin(self, uri, data=None):
         self.now_ua = self.ua.random
         cookies = {"sdkVersion": "3.9", "deviceId": self.token["deviceId"],

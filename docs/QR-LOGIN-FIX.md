@@ -18,3 +18,11 @@
 參考比對：原始程式與 [mijia-api 掃碼流程](https://github.com/Do1e/mijia-api/blob/main/mijiaAPI/apis.py)、[ha_miband QR connector](https://github.com/lzghzr/ha_miband/blob/main/cloud.py)。這些為第三方實作，不能視為小米官方 API 支援承諾。
 
 升級會使記憶體內舊 QR 失效。請重新整理面板，確認版本 `3.12.1-ai01zm-experimental.2`，重新產生 QR，再用米家 App 掃碼並於手機確認。沒有手機確認，就不能驗證完整的新帳號登入成功；MiNA 是否列出鬧鐘仍須另外驗證。
+
+## experimental.3：音箱服務登入隔離
+
+現場收到手機掃碼資料後，.2 的同一會話交換 MiNA 憑證反覆失敗；使用已保存的 passport 在全新會話中交換 micoapi 則實測成功。新修正將有 passToken 的 SID 登入一律隔離 Cookie jar，成功後只把已驗證的服務憑證合併回原帳號，保留同一使用者的其他 SID；失敗保留原憑證，不刪除 token 檔。這適用於一般小愛音箱的 MiNA 登入，也用於米家 xiaomiio 的交叉診斷。
+
+新增 `/api/qr/status` 只回傳安全階段、是否已收掃碼資料、剩餘秒數及最近成功時間，不回傳帳號、QR 網址、Cookie 或 token。收到掃碼後驗證尚未完成時，提示不再誤稱單純等待掃碼。
+
+本機測試增為 31 項 Python 測試，另有 3 項前端排程情境。登入成功仍不代表設備出現在 MiNA，也不代表任意型號提供對話 API；新型號必須以實際設備路由與聲音驗證。

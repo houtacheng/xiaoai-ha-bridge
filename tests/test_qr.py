@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from xiaoai_compat import classify_qr_poll, parse_xiaomi_json
+import xiaoai_compat
 
 
 class QRTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +83,48 @@ class QRTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result['done'])
         finally:
             b._qr_flow_lock.release()
+
+    async def test_status_identifies_received_scan_without_disclosing_it(self):
+        b = self.bridge
+        b._qr_state.update(ready=True, stage='exchanging_micoapi', pending_scan={'passToken':'private-pass'}, lp_url='private-url', deadline=time.monotonic()+100)
+        state = await b.qr_login_status()
+        self.assertTrue(state['scan_received'])
+        self.assertEqual(state['stage'], 'exchanging_micoapi')
+        self.assertNotIn('private-', json.dumps(state))
+        await b._qr_flow_lock.acquire()
+        try:
+            waiting = await b.qr_login_poll()
+            self.assertIn('已收到扫码', waiting['msg'])
+        finally:
+            b._qr_flow_lock.release()
+
+    async def test_passport_exchange_uses_clean_cookie_jar_and_retains_other_sids(self):
+        parent = xiaoai_compat.MiAccount(MagicMock(), '', '', None)
+        original = {'userId':'test-user', 'passToken':'test-pass', 'deviceId':'test-device', 'xiaomiio':['io-security','io-token']}
+        parent.token = original.copy()
+        isolated_session = MagicMock()
+        context = MagicMock()
+        context.__aenter__.return_value = isolated_session
+        async def login(account, sid):
+            self.assertIs(account.session, isolated_session)
+            self.assertNotIn('xiaomiio', account.token)
+            account.token[sid] = ['mina-security','mina-token']
+            return True
+        with patch.object(xiaoai_compat.aiohttp, 'ClientSession', return_value=context), patch.object(xiaoai_compat._MiAccount, 'login', new=AsyncMock(side_effect=login)):
+            self.assertTrue(await parent.login('micoapi'))
+        self.assertEqual(parent.token['xiaomiio'], original['xiaomiio'])
+        self.assertEqual(parent.token['micoapi'], ['mina-security','mina-token'])
+
+    async def test_passport_exchange_failure_preserves_existing_credentials(self):
+        parent = xiaoai_compat.MiAccount(MagicMock(), '', '', None)
+        parent.token = {'userId':'test-user','passToken':'test-pass','deviceId':'test-device','micoapi':['old-security','old-token']}
+        original = parent.token.copy()
+        parent.token_store = MagicMock()
+        context = MagicMock()
+        with patch.object(xiaoai_compat.aiohttp, 'ClientSession', return_value=context), patch.object(xiaoai_compat._MiAccount, 'login', new=AsyncMock(return_value=False)):
+            self.assertFalse(await parent.login('micoapi'))
+        self.assertEqual(parent.token, original)
+        parent.token_store.save_token.assert_not_called()
 
     async def test_new_qr_preserves_cookie_session_and_closes_previous(self):
         b = self.bridge

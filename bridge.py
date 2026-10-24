@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1-ai01zm-experimental.2"
+VERSION = "3.12.1-ai01zm-experimental.3"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -3012,7 +3012,7 @@ async def qr_login_start():
                 raise ValueError("qr_response_missing_urls")
             # This session holds the QR cookies through polling and the callback.
             _qr_state.update(session=session, lp_url=lp_url, device_id=device_id, ready=True,
-                             deadline=time.monotonic() + min(max(int(login_data.get("timeout", 180)), 30), 600))
+                             deadline=time.monotonic() + min(max(int(login_data.get("timeout", 180)), 30), 600), stage="waiting_scan")
             log.info("QR 登录二维码已生成")
             return {"ok": True, "qr_url": qr_url, "msg": "请用米家 App 扫码并在手机确认"}
         except Exception as e:
@@ -3071,7 +3071,9 @@ async def _finish_qr_login(session, scan):
 async def qr_login_poll():
     """At most one request / credential exchange may use a QR session at a time."""
     if _qr_flow_lock.locked():
-        return {"ok": True, "done": False, "msg": "正在等待扫码确认…"}
+        stage = _qr_state.get("stage", "waiting_scan")
+        return {"ok": True, "done": False, "stage": stage,
+                "msg": "已收到扫码，正在验证 MiNA 登录…" if stage == "exchanging_micoapi" else "正在等待扫码确认…"}
     async with _qr_flow_lock:
         if not _qr_state.get("ready"):
             return {"ok": False, "done": False, "terminal": True, "msg": "请重新生成二维码"}
@@ -3090,16 +3092,34 @@ async def qr_login_poll():
                         await _clear_qr_state()
                     return public
                 _qr_state["pending_scan"] = scan
+            _qr_state["stage"] = "exchanging_micoapi"
             await _finish_qr_login(session, scan)
             await _clear_qr_state()
+            bridge_state["xiaomi_login_verified_time"] = int(time.time())
             log.info("QR 与 micoapi 登录验证成功")
             return {"ok": True, "done": True, "msg": "扫码登录成功，MiNA 凭证已验证"}
         except asyncio.TimeoutError:
             return {"ok": True, "done": False, "msg": "等待扫码或服务确认…"}
         except Exception as e:
-            log.warning("QR 验证失败: %s", e)
+            _qr_state["stage"] = "exchange_retry" if _qr_state.get("pending_scan") else "waiting_scan"
+            reason = str(e) if str(e) in {"qr_micoapi_exchange_failed", "qr_micoapi_token_missing"} else "qr_exchange_error"
+            log.warning("QR 验证失败 | reason=%s | type=%s", reason, type(e).__name__)
             return {"ok": False, "done": False, "terminal": False,
-                    "msg": "扫码验证暂未完成，原登入资料未更改，正在重试", "error_type": type(e).__name__}
+                    "stage": _qr_state["stage"], "reason": reason,
+                    "msg": "已收到扫码，MiNA 登录验证暂未完成，正在重试；原登入资料未更改" if _qr_state.get("pending_scan") else "等待扫码服务恢复，原登入资料未更改", "error_type": type(e).__name__}
+
+
+@app.get("/api/qr/status")
+async def qr_login_status():
+    """Safe progress only. Does not poll Xiaomi or disclose QR / account data."""
+    return {
+        "ready": bool(_qr_state.get("ready")),
+        "stage": _qr_state.get("stage", "idle"),
+        "scan_received": bool(_qr_state.get("pending_scan")),
+        "busy": _qr_flow_lock.locked(),
+        "remaining_seconds": max(0, int(_qr_state.get("deadline", 0) - time.monotonic())),
+        "last_verified_time": bridge_state.get("xiaomi_login_verified_time"),
+    }
 
 
 class TestHARequest(BaseModel):
