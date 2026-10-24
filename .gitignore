@@ -32,3 +32,6 @@ venv/
 
 # Docker
 docker-compose.override.yml
+
+# Transactional QR credential writes
+config/*.qr-pending

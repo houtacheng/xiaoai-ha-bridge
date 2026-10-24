@@ -951,7 +951,7 @@ body{
 // ═══════════ State ═══════════
 let cfg = {};
 let autoScroll = true;
-let logTimer = null, statusTimer = null, qrPollTimer = null;
+let logTimer = null, statusTimer = null, qrPollTimer = null, qrGeneration = 0, qrStarting = false;
 let deviceAliases = {};
 let deviceCache = [], deviceTypeFilter = 'all';
 let pickerDevices = null, pickerTarget = null;
@@ -1158,8 +1158,50 @@ async function saveCfg(sec){
 }
 
 // ═══════════ Xiaomi ═══════════
-async function qrLogin(){const a=document.getElementById('xiaomi-alert');showAlert(a,'warn','⟳ 生成二维码...');try{const r=await fetch('/api/qr/login',{method:'POST'});const d=await r.json();if(d.ok&&d.qr_url){document.getElementById('qr-img').src=d.qr_url;document.getElementById('qr-area').style.display='';document.getElementById('qr-msg').textContent='用米家 App 扫码';document.getElementById('qr-status').textContent='等待扫码...';showAlert(a,'warn','📱 扫码');if(qrPollTimer)clearInterval(qrPollTimer);qrPollTimer=setInterval(pollQrLogin,3000)}else{showAlert(a,'err','✗ '+(d.msg||'失败'))}}catch(e){showAlert(a,'err','✗ '+e.message)}}
-async function pollQrLogin(){try{const r=await fetch('/api/qr/poll');const d=await r.json();if(d.done){clearInterval(qrPollTimer);document.getElementById('qr-status').textContent=d.msg;document.getElementById('qr-area').style.display='none';const a=document.getElementById('xiaomi-alert');showAlert(a,'ok','✓ '+d.msg);searchDevices()}else if(!d.ok){document.getElementById('qr-status').textContent=d.msg||'错误'}}catch(e){}}
+async function qrLogin(){
+  if(qrStarting)return;
+  qrStarting=true;
+  const generation=++qrGeneration;
+  if(qrPollTimer)clearTimeout(qrPollTimer);
+  qrPollTimer=null;
+  const a=document.getElementById('xiaomi-alert');
+  showAlert(a,'warn','⟳ 生成二维码...');
+  try{
+    const r=await fetch('/api/qr/login',{method:'POST'});
+    const d=await r.json();
+    if(generation!==qrGeneration)return;
+    if(d.ok&&d.qr_url){
+      document.getElementById('qr-img').src=d.qr_url;
+      document.getElementById('qr-area').style.display='';
+      document.getElementById('qr-msg').textContent='用米家 App 扫码并在手机确认';
+      document.getElementById('qr-status').textContent='等待扫码...';
+      showAlert(a,'warn','📱 扫码');
+      qrPollTimer=setTimeout(()=>pollQrLogin(generation),500);
+    }else{showAlert(a,'err','✗ '+(d.msg||'失败'))}
+  }catch(e){showAlert(a,'err','二维码初始化失败，请重试')}
+  finally{qrStarting=false}
+}
+async function pollQrLogin(generation=qrGeneration){
+  if(generation!==qrGeneration)return;
+  let again=true;
+  try{
+    const r=await fetch('/api/qr/poll');
+    const d=await r.json();
+    if(generation!==qrGeneration)return;
+    document.getElementById('qr-status').textContent=d.msg||'等待扫码...';
+    if(d.done){
+      again=false;
+      document.getElementById('qr-area').style.display='none';
+      showAlert(document.getElementById('xiaomi-alert'),'ok','✓ '+d.msg);
+      searchDevices();
+    }else if(d.terminal){again=false}
+  }catch(e){
+    if(generation===qrGeneration)document.getElementById('qr-status').textContent='连接暂时中断，正在重试…';
+  }finally{
+    // Schedule only after the previous request settles; discard old QR responses.
+    if(again&&generation===qrGeneration)qrPollTimer=setTimeout(()=>pollQrLogin(generation),3000);
+  }
+}
 
 function renderDeviceList(devices){const box=document.getElementById('mi-device-list');const c=document.getElementById('mi-devices');const ce=document.getElementById('mi-device-count');box.style.display='';ce.textContent='('+devices.length+'台)';c.innerHTML=devices.map(d=>{const n=escHtml(d.name||'未知');const h=escHtml(d.hardware||d.model||'');const hw=escHtml(d.hardware||'');const did=escHtml(d.deviceID||d.did||'');return'<div class="rule-item" style="cursor:pointer" onclick="selectDevice(\''+escAttr(hw)+'\',\''+escAttr(did)+'\')"><div style="display:flex;align-items:center;justify-content:space-between"><div><span style="color:var(--txt-primary);font-size:14px;font-weight:500">'+n+'</span><span style="color:var(--txt-muted);font-size:11px;margin-left:10px">'+h+'</span></div><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">DID: '+(did?did.substring(0,12)+'...':'—')+'</span></div></div>'}).join('');if(devices.length===1&&!gv('mi-did')){const f=devices[0];selectDevice(f.hardware||'',f.deviceID||'')}}
 function selectDevice(hw,did){document.getElementById('mi-hardware').value=hw||'';if(did)document.getElementById('mi-did').value=did}
@@ -1173,7 +1215,7 @@ async function searchDevices(){
     if(d.ok){
       showAlert(a,'ok','✓ '+(d.msg||'获取成功'));
       if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
-      else showAlert(a,'warn','⚠ 账号下没有找到小爱音箱，请先在米家 App 里添加');
+      else showAlert(a,'warn','⚠ MiNA 清单未返回设备；米家可见不代表 MiNA 提供该设备，请查看安全诊断结果');
     }else{
       showAlert(a,'err','✗ '+(d.msg||'获取失败')+' —— 若登录已失效，请重新扫码');
     }

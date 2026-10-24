@@ -9,6 +9,51 @@ CLOCK_MODEL = "zimi.clock.myk01"
 _secrets = set()
 
 
+def parse_xiaomi_json(raw):
+    text = raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw.lstrip("\ufeff")
+    text = text.strip()
+    if text.startswith("&&&START&&&"):
+        text = text[len("&&&START&&&"):].lstrip()
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise ValueError("xiaomi_response_not_object")
+    return value
+
+
+def classify_qr_poll(status, raw):
+    """Public state plus PRIVATE successful scan data, never raw error content."""
+    waiting = {"ok": True, "done": False, "msg": "等待扫码或手机确认…"}
+    if status in (204, 408, 504):
+        return waiting, None
+    if status in (401, 403, 404, 410):
+        return {"ok": False, "done": False, "terminal": True,
+                "reason": "qr_rejected_or_expired", "http_status": status,
+                "msg": "二维码会话已过期或被拒绝，请重新生成；若持续发生请检查网络"}, None
+    if status != 200:
+        return {"ok": False, "done": False, "terminal": status < 429,
+                "reason": "qr_upstream_http", "http_status": status,
+                "msg": "扫码服务暂时不可用，稍后重试"}, None
+    if not raw.strip():
+        return waiting, None
+    try:
+        data = parse_xiaomi_json(raw)
+    except (ValueError, UnicodeError):
+        return {"ok": False, "done": False, "terminal": False,
+                "reason": "qr_non_json", "http_status": status,
+                "response_kind": "html" if raw.lstrip().startswith(b"<") else "non_json",
+                "msg": "扫码服务返回非 JSON 响应，正在重试；若持续发生请重新生成"}, None
+    if data.get("code", 0) not in (0, "0"):
+        return {"ok": False, "done": False, "terminal": True,
+                "reason": "qr_upstream_rejected", "msg": "二维码会话被拒绝，请重新生成"}, None
+    if data.get("userId") or data.get("passToken"):
+        if not (data.get("userId") and data.get("passToken")
+                and (data.get("ssecurity") or data.get("psecurity"))):
+            return {"ok": False, "done": False, "terminal": True,
+                    "reason": "qr_incomplete_credentials", "msg": "扫码资料不完整，原登入资料未更改，请重试"}, None
+        return {"ok": True, "done": False, "msg": "已扫码，正在验证 MiNA 登录…"}, data
+    return waiting, None
+
+
 class MiAccount(_MiAccount):
     """2.9.3's login helper disables TLS verification; keep it enabled here."""
     async def _serviceLogin(self, uri, data=None):
@@ -23,7 +68,7 @@ class MiAccount(_MiAccount):
             headers={"User-Agent": self.now_ua}, ssl=True,
         ) as response:
             raw = await response.read()
-        return json.loads(raw[11:])
+        return parse_xiaomi_json(raw)
 
 
 def remember_secrets(value, sensitive=False):

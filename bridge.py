@@ -26,14 +26,15 @@ import yaml
 os.umask(0o077)
 from xiaoai_compat import (SafeLogFilter, remember_secrets, discover_devices,
                            select_target, conversation_api, parse_http_records,
-                           fetch_mina_records, public_devices, MiAccount, require_ubus_success)
+                           fetch_mina_records, public_devices, MiAccount, require_ubus_success,
+                           parse_xiaomi_json, classify_qr_poll)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1-ai01zm-experimental"
+VERSION = "3.12.1-ai01zm-experimental.2"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -45,6 +46,7 @@ COOKIE_TEMPLATE = "deviceId={device_id}; serviceToken={service_token}; userId={u
 
 # QR 扫码登录状态
 _qr_state: dict = {}
+_qr_flow_lock = asyncio.Lock()
 
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2962,155 +2964,142 @@ async def _handle_ai_fallback(query: str, cfg: dict, diag: dict, na,
 
 # ──────────────── QR 扫码登录（绕过短信验证） ────────────────
 
+_QR_HEADERS = {
+    "User-Agent": "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103",
+    "Content-Type": "application/x-www-form-urlencoded",
+}
+
+
+async def _clear_qr_state():
+    session = _qr_state.get("session")
+    _qr_state.clear()
+    if session and not session.closed:
+        await session.close()
+
+
 @app.post("/api/qr/login")
 async def qr_login_start():
-    """发起 QR 扫码登录，返回二维码链接"""
-    import string, random
+    """Create a QR session without replacing any saved credentials."""
+    from urllib.parse import urlsplit
+    import secrets
+    async with _qr_flow_lock:
+        await _clear_qr_state()
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        try:
+            device_id = secrets.token_hex(8).upper()
+            async with session.get(
+                "https://account.xiaomi.com/pass/serviceLogin",
+                params={"_json": "true", "sid": "mijia", "deviceId": device_id, "_locale": "zh_CN"},
+                headers=_QR_HEADERS, ssl=True,
+            ) as response:
+                response.raise_for_status()
+                service_data = parse_xiaomi_json(await response.read())
+            location = service_data.get("location", "")
+            if not location or service_data.get("code") == 0:
+                raise ValueError("qr_login_entry_missing")
+            query = urlsplit(location).query
+            if not query:
+                raise ValueError("qr_login_query_missing")
+            async with session.get(
+                "https://account.xiaomi.com/longPolling/loginUrl?" + query,
+                headers=_QR_HEADERS, ssl=True,
+            ) as response:
+                response.raise_for_status()
+                login_data = parse_xiaomi_json(await response.read())
+            qr_url = login_data.get("qr")
+            lp_url = login_data.get("lp")
+            if not qr_url or not lp_url:
+                raise ValueError("qr_response_missing_urls")
+            # This session holds the QR cookies through polling and the callback.
+            _qr_state.update(session=session, lp_url=lp_url, device_id=device_id, ready=True,
+                             deadline=time.monotonic() + min(max(int(login_data.get("timeout", 180)), 30), 600))
+            log.info("QR 登录二维码已生成")
+            return {"ok": True, "qr_url": qr_url, "msg": "请用米家 App 扫码并在手机确认"}
+        except Exception as e:
+            await session.close()
+            log.warning("QR 初始化失败: %s", e)
+            return {"ok": False, "msg": "二维码初始化失败，请稍后重试", "error_type": type(e).__name__}
+
+
+async def _finish_qr_login(session, scan):
+    """Exchange passport credentials for micoapi; a mijia token is not a MiNA token."""
+    callback_url = scan.get("location")
+    if callback_url and not _qr_state.get("callback_done"):
+        async with session.get(callback_url, headers=_QR_HEADERS, ssl=True) as response:
+            response.raise_for_status()
+            await response.read()
+        _qr_state["callback_done"] = True
+    account = MiAccount(session, "", "", None)
+    account.token = {"passToken": scan["passToken"], "userId": str(scan["userId"]),
+                     "deviceId": _qr_state["device_id"]}
+    remember_secrets(account.token)
+    if not await asyncio.wait_for(account.login("micoapi"), timeout=35):
+        raise ValueError("qr_micoapi_exchange_failed")
+    pair = (account.token or {}).get("micoapi")
+    if not isinstance(pair, (list, tuple)) or len(pair) != 2 or not all(pair):
+        raise ValueError("qr_micoapi_token_missing")
+    remember_secrets(account.token)
+    # Prepare and roll back all three files if writing fails. Never publish partial login.
+    cfg = load_config()
+    cfg.setdefault("xiaomi", {})["cookie_text"] = (
+        f"userId={account.token['userId']}; passToken={account.token['passToken']}; "
+        f"serviceToken={pair[1]}; deviceId={account.token['deviceId']}")
+    auth = {k: account.token.get(k, "") for k in ("passToken", "userId", "deviceId")}
+    previous = {path: path.read_bytes() if path.exists() else None
+                for path in (AUTH_PATH, TOKEN_PATH, CONFIG_PATH)}
     try:
-        device_id = ''.join(random.choices(string.ascii_letters + string.digits, k=16)).upper()
-        headers = {
-            "User-Agent": "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        s = aiohttp.ClientSession()
-        # Step 1: serviceLogin?sid=mijia
-        url = f"https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=mijia&deviceId={device_id}&_locale=zh_CN"
-        log.info("QR Step1: %s", url[:80])
-        try:
-            async with s.get(url, headers=headers, ssl=True) as r:
-                raw = await r.read()
-        except Exception as e:
-            await s.close()
-            return {"ok": False, "msg": f"无法连接小米服务器: {type(e).__name__}"}
-
-        # 尝试解析响应（去掉可能的 &&& 前缀）
-        text = raw.decode("utf-8", errors="replace")
-        try:
-            service_data = json.loads(text) if text.startswith("{") else json.loads(text[11:])
-        except Exception:
-            await s.close()
-            return {"ok": False, "msg": "小米返回无法解析的登录响应"}
-
-        log.info("QR Step1 resp: code=%s", service_data.get("code"))
-        if service_data.get("code") == 0:
-            await s.close()
-            return {"ok": False, "msg": "服务异常，请稍后重试"}
-
-        location = service_data.get("location", "")
-        if not location:
-            await s.close()
-            return {"ok": False, "msg": "无法获取登录入口"}
-
-        # Step 2: 获取二维码
-        from urllib.parse import urlencode
-        login_url = "https://account.xiaomi.com/longPolling/loginUrl"
-        full_url = login_url + "?" + location.split("?")[1] if "?" in location else login_url + "?" + location
-        try:
-            async with s.get(full_url, headers=headers, ssl=True) as r:
-                raw = await r.read()
-        except Exception as e:
-            await s.close()
-            return {"ok": False, "msg": f"获取二维码网络失败: {type(e).__name__}"}
-
-        text = raw.decode("utf-8", errors="replace")
-        try:
-            login_data = json.loads(text) if text.startswith("{") else json.loads(text[11:])
-        except Exception:
-            await s.close()
-            return {"ok": False, "msg": "二维码接口返回无法解析的响应"}
-
-        await s.close()
-        qr_url = login_data.get("qr", login_data.get("loginUrl", ""))
-        lp_url = login_data.get("lp", "")
-        if not qr_url or not lp_url:
-            return {"ok": False, "msg": "获取二维码失败: " + str(list(login_data.keys()))}
-
-        _qr_state["lp_url"] = lp_url
-        _qr_state["device_id"] = device_id
-        _qr_state["ready"] = True
-        log.info("QR 登录二维码已生成")
-        return {"ok": True, "qr_url": qr_url, "msg": "请用米家 App 扫描二维码"}
-    except Exception as e:
-        log.exception("QR 登录异常: %s", e)
-        return {"ok": False, "msg": f"QR 登录失败: {type(e).__name__}"}
+        for path, data in ((AUTH_PATH, auth), (TOKEN_PATH, account.token)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".qr-pending")
+            temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(path)
+        save_config(cfg)
+    except Exception:
+        for path, content in previous.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(content)
+        raise
+    finally:
+        for path in (AUTH_PATH, TOKEN_PATH):
+            path.with_name(path.name + ".qr-pending").unlink(missing_ok=True)
 
 
 @app.get("/api/qr/poll")
 async def qr_login_poll():
-    """轮询扫码结果"""
-    if not _qr_state.get("ready"):
-        return {"ok": False, "done": False, "msg": "请先点击扫码登录"}
-
-    lp_url = _qr_state.get("lp_url", "")
-    headers = {
-        "User-Agent": "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103",
-        "Connection": "keep-alive",
-    }
-    s = aiohttp.ClientSession()
-    try:
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with s.get(lp_url, headers=headers, ssl=True, timeout=timeout) as r:
-            raw = await r.read()
-        text = raw.decode("utf-8", errors="replace")
+    """At most one request / credential exchange may use a QR session at a time."""
+    if _qr_flow_lock.locked():
+        return {"ok": True, "done": False, "msg": "正在等待扫码确认…"}
+    async with _qr_flow_lock:
+        if not _qr_state.get("ready"):
+            return {"ok": False, "done": False, "terminal": True, "msg": "请重新生成二维码"}
+        if time.monotonic() >= _qr_state.get("deadline", 0):
+            await _clear_qr_state()
+            return {"ok": False, "done": False, "terminal": True, "msg": "二维码已过期，请重新生成"}
+        session = _qr_state["session"]
         try:
-            lp_data = json.loads(text) if text.startswith("{") else json.loads(text[11:])
-        except Exception:
-            await s.close()
-            return {"ok": False, "done": False, "msg": "扫码轮询返回无法解析的响应"}
-        # 检查是否扫码成功
-        if lp_data.get("psecurity") and lp_data.get("userId"):
-            # Step 3: 获取 serviceToken
-            callback_url = lp_data.get("location", "")
-            if callback_url:
-                async with s.get(callback_url, headers=headers, ssl=True) as r:
-                    pass
-            sts_cookies = {k: v.value for k, v in
-                           s.cookie_jar.filter_cookies(
-                               __import__('yarl').URL('https://api2.mina.mi.com/')).items()}
-            service_token = sts_cookies.get("serviceToken", "")
-            if not service_token:
-                service_token = lp_data.get("serviceToken", "")
-
-            # 保存 auth 数据
-            auth_data = {
-                "passToken": lp_data["passToken"],
-                "userId": str(lp_data["userId"]),
-                "deviceId": _qr_state.get("device_id", ""),
-                "ssecurity": lp_data.get("ssecurity", lp_data.get("psecurity", "")),
-                "serviceToken": service_token,
-            }
-            AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(AUTH_PATH, "w", encoding="utf-8") as f:
-                json.dump(auth_data, f, ensure_ascii=False)
-            # 保存 .mi.token
-            token_data = {**auth_data, "micoapi": [auth_data["ssecurity"], service_token]}
-            TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(TOKEN_PATH, "w", encoding="utf-8") as f:
-                json.dump(token_data, f, ensure_ascii=False)
-            # 保存 cookie_text 到配置
-            cfg = load_config()
-            mi_cfg = cfg.get("xiaomi", {})
-            cookie_text = f"userId={auth_data['userId']}; passToken={auth_data['passToken']}; serviceToken={service_token}; deviceId={auth_data['deviceId']}"
-            cfg.setdefault("xiaomi", {})["cookie_text"] = cookie_text
-            save_config(cfg)
-            _qr_state.clear()
-            remember_secrets(auth_data)
-            remember_secrets(token_data)
-            log.info("QR 扫码登录成功")
-            await s.close()
-            return {"ok": True, "done": True, "msg": f"扫码登录成功! userId={auth_data['userId']}"}
-        else:
-            await s.close()
-            return {"ok": True, "done": False, "msg": "等待扫码中..."}
-    except asyncio.TimeoutError:
-        await s.close()
-        return {"ok": True, "done": False, "msg": "等待扫码中..."}
-    except Exception as e:
-        await s.close()
-        if "401" in str(e) or "timeout" in str(e).lower():
-            return {"ok": True, "done": False, "msg": "等待扫码中..."}
-        log.warning("QR 轮询异常: %s", e)
-        return {"ok": False, "done": False, "msg": f"轮询错误: {type(e).__name__}"}
+            scan = _qr_state.get("pending_scan")
+            if scan is None:
+                async with session.get(_qr_state["lp_url"], headers=_QR_HEADERS, ssl=True,
+                                       timeout=aiohttp.ClientTimeout(total=25)) as response:
+                    public, scan = classify_qr_poll(response.status, await response.read())
+                if scan is None:
+                    if public.get("terminal"):
+                        await _clear_qr_state()
+                    return public
+                _qr_state["pending_scan"] = scan
+            await _finish_qr_login(session, scan)
+            await _clear_qr_state()
+            log.info("QR 与 micoapi 登录验证成功")
+            return {"ok": True, "done": True, "msg": "扫码登录成功，MiNA 凭证已验证"}
+        except asyncio.TimeoutError:
+            return {"ok": True, "done": False, "msg": "等待扫码或服务确认…"}
+        except Exception as e:
+            log.warning("QR 验证失败: %s", e)
+            return {"ok": False, "done": False, "terminal": False,
+                    "msg": "扫码验证暂未完成，原登入资料未更改，正在重试", "error_type": type(e).__name__}
 
 
 class TestHARequest(BaseModel):
