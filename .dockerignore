@@ -1,0 +1,11 @@
+.git
+.env
+.venv
+venv
+__pycache__
+*.pyc
+config
+logs
+tests
+*.zip
+*.patch

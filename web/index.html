@@ -768,6 +768,8 @@ body{
         <div class="card-head"><div class="card-title"><span>&#9881;</span>设备参数</div></div>
         <div class="form-grid">
           <div class="field"><label>音箱型号</label><input type="text" id="mi-hardware" placeholder="测试连接自动填充"></div>
+          <div class="field"><label>对话 API（闹钟实验功能，尚未实机验证）</label><select id="mi-conversation-api"><option value="auto">自动（保留原有型号规则）</option><option value="mina">MiNA / mibrain nlp_result_get</option><option value="http">HTTP / conversation</option></select></div>
+          <label><input type="checkbox" id="mi-discovery-all"> 同时查询 MiNA master=1 清单（不保证包含闹钟）</label>
           <div class="field"><label>设备 DID</label><input type="text" id="mi-did" placeholder="点击设备自动填入"></div>
           <div class="field full"><div class="toggle-wrap"><label class="toggle"><input type="checkbox" id="mi-tts" checked><div class="toggle-track"></div><div class="toggle-thumb"></div></label><span class="toggle-label">TTS语音反馈</span></div></div>
         </div>
@@ -992,7 +994,7 @@ async function loadConfig() {
 function applyConfigToUI() {
   const mi=cfg.xiaomi||{};const ha=cfg.homeassistant||{};
   safeSet('mi-did',mi.device_did||'');safeCheck('mi-tts',mi.tts_reply!==false);
-  safeSet('mi-hardware',mi.hardware||'');safeSet('ha-url',ha.url||'');safeSet('ha-token',ha.token||'');
+  safeSet('mi-conversation-api',mi.conversation_api||'auto');safeCheck('mi-discovery-all',!!mi.discovery_all);safeSet('mi-hardware',mi.hardware||'');safeSet('ha-url',ha.url||'');safeSet('ha-token',ha.token||'');
   safeSet('adv-interval',cfg.poll_interval_seconds||2);
   const oai=cfg.openai||{};safeSet('adv-ai-key',oai.api_key||'');safeSet('adv-ai-model',oai.model||'gpt-4o-mini');
   const base=oai.api_base||'https://api.openai.com';safeSet('adv-ai-base',base);
@@ -1080,7 +1082,7 @@ function showLoad(on){document.getElementById('ctrl-loading').classList.toggle('
 // ═══════════ Save ═══════════
 // 基于旧对象展开：账号密码/Cookie 已不在界面上，重建对象会把它们清空
 // （POST /api/config 是整份覆盖）。展开后 password 的掩码由后端还原成真值。
-async function saveXiaomi(){cfg.xiaomi={...(cfg.xiaomi||{}),hardware:gv('mi-hardware'),device_did:gv('mi-did'),tts_reply:document.getElementById('mi-tts').checked};await saveCfg('xiaomi')}
+async function saveXiaomi(){cfg.xiaomi={...(cfg.xiaomi||{}),conversation_api:gv('mi-conversation-api')||'auto',discovery_all:document.getElementById('mi-discovery-all').checked,hardware:gv('mi-hardware'),device_did:gv('mi-did'),tts_reply:document.getElementById('mi-tts').checked};await saveCfg('xiaomi')}
 async function saveHA(){cfg.homeassistant={url:gv('ha-url'),token:gv('ha-token')};await saveCfg('ha')}
 async function saveAdvanced(){
   cfg.poll_interval_seconds=parseInt(gv('adv-interval'))||2;
@@ -1159,8 +1161,8 @@ async function saveCfg(sec){
 async function qrLogin(){const a=document.getElementById('xiaomi-alert');showAlert(a,'warn','⟳ 生成二维码...');try{const r=await fetch('/api/qr/login',{method:'POST'});const d=await r.json();if(d.ok&&d.qr_url){document.getElementById('qr-img').src=d.qr_url;document.getElementById('qr-area').style.display='';document.getElementById('qr-msg').textContent='用米家 App 扫码';document.getElementById('qr-status').textContent='等待扫码...';showAlert(a,'warn','📱 扫码');if(qrPollTimer)clearInterval(qrPollTimer);qrPollTimer=setInterval(pollQrLogin,3000)}else{showAlert(a,'err','✗ '+(d.msg||'失败'))}}catch(e){showAlert(a,'err','✗ '+e.message)}}
 async function pollQrLogin(){try{const r=await fetch('/api/qr/poll');const d=await r.json();if(d.done){clearInterval(qrPollTimer);document.getElementById('qr-status').textContent=d.msg;document.getElementById('qr-area').style.display='none';const a=document.getElementById('xiaomi-alert');showAlert(a,'ok','✓ '+d.msg);searchDevices()}else if(!d.ok){document.getElementById('qr-status').textContent=d.msg||'错误'}}catch(e){}}
 
-function renderDeviceList(devices){const box=document.getElementById('mi-device-list');const c=document.getElementById('mi-devices');const ce=document.getElementById('mi-device-count');box.style.display='';ce.textContent='('+devices.length+'台)';c.innerHTML=devices.map(d=>{const n=escHtml(d.name||'未知');const h=escHtml(d.hardware||d.model||'');const did=escHtml(d.deviceID||d.did||'');return'<div class="rule-item" style="cursor:pointer" onclick="selectDevice(\''+escAttr(h)+'\',\''+escAttr(did)+'\')"><div style="display:flex;align-items:center;justify-content:space-between"><div><span style="color:var(--txt-primary);font-size:14px;font-weight:500">'+n+'</span><span style="color:var(--txt-muted);font-size:11px;margin-left:10px">'+h+'</span></div><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">DID: '+(did?did.substring(0,12)+'...':'—')+'</span></div></div>'}).join('');if(devices.length>0){const f=devices[0];selectDevice(f.hardware||f.model||'',f.deviceID||f.did||'')}}
-function selectDevice(hw,did){if(hw)document.getElementById('mi-hardware').value=hw;if(did)document.getElementById('mi-did').value=did}
+function renderDeviceList(devices){const box=document.getElementById('mi-device-list');const c=document.getElementById('mi-devices');const ce=document.getElementById('mi-device-count');box.style.display='';ce.textContent='('+devices.length+'台)';c.innerHTML=devices.map(d=>{const n=escHtml(d.name||'未知');const h=escHtml(d.hardware||d.model||'');const hw=escHtml(d.hardware||'');const did=escHtml(d.deviceID||d.did||'');return'<div class="rule-item" style="cursor:pointer" onclick="selectDevice(\''+escAttr(hw)+'\',\''+escAttr(did)+'\')"><div style="display:flex;align-items:center;justify-content:space-between"><div><span style="color:var(--txt-primary);font-size:14px;font-weight:500">'+n+'</span><span style="color:var(--txt-muted);font-size:11px;margin-left:10px">'+h+'</span></div><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">DID: '+(did?did.substring(0,12)+'...':'—')+'</span></div></div>'}).join('');if(devices.length===1&&!gv('mi-did')){const f=devices[0];selectDevice(f.hardware||'',f.deviceID||'')}}
+function selectDevice(hw,did){document.getElementById('mi-hardware').value=hw||'';if(did)document.getElementById('mi-did').value=did}
 // 用已保存的凭据拉取音箱列表。扫码成功后也会走这里，避免两处重复。
 async function searchDevices(){
   const a=document.getElementById('xiaomi-alert');

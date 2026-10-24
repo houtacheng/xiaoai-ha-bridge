@@ -9,6 +9,11 @@ xiaomi:
   password: 'your_xiaomi_password'
   hardware: L06A
   device_did: ''
+  # 实验功能：不推断 AI01ZM / zimi.clock.myk01 的 MiNA hardware
+  conversation_api: auto  # auto / mina / http；逐一诊断后明确选择
+  discovery_all: false   # true 时额外查询 master=1
+  device_id: ''          # 仅填实际 MiNA deviceID；不是米家 did
+  allow_unlisted_device: false  # 仅在本机已取得 MiNA ID 时手动实验
   tts_reply: true
   cookie_text: ''
 

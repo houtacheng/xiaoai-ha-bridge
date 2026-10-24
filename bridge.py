@@ -23,13 +23,17 @@ from typing import Any
 
 import aiohttp
 import yaml
+os.umask(0o077)
+from xiaoai_compat import (SafeLogFilter, remember_secrets, discover_devices,
+                           select_target, conversation_api, parse_http_records,
+                           fetch_mina_records, public_devices, MiAccount, require_ubus_success)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1"
+VERSION = "3.12.1-ai01zm-experimental"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -38,7 +42,6 @@ WEB_PORT = 47521
 
 LATEST_ASK_API = "https://userprofile.mina.mi.com/device_profile/v2/conversation?source=dialogu&hardware={hardware}&timestamp={timestamp}&limit=2"
 COOKIE_TEMPLATE = "deviceId={device_id}; serviceToken={service_token}; userId={user_id}"
-GET_ASK_BY_MINA = ["M01"]
 
 # QR 扫码登录状态
 _qr_state: dict = {}
@@ -71,6 +74,8 @@ logging.basicConfig(
         MemHandler(),
     ],
 )
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(SafeLogFilter())
 log = logging.getLogger(__name__)
 
 # 接入 miservice 库的 DEBUG 日志，便于诊断登录问题
@@ -100,10 +105,19 @@ def load_config() -> dict:
         save_config(default)
         return default
     with open(CONFIG_PATH, encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+        remember_secrets(cfg)
+        for path in (TOKEN_PATH, AUTH_PATH):
+            if path.exists():
+                try:
+                    remember_secrets(json.loads(path.read_text()))
+                except (ValueError, OSError):
+                    pass
+        return cfg
 
 
 def save_config(cfg: dict):
+    remember_secrets(cfg)
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
@@ -116,6 +130,9 @@ def _default_config() -> dict:
             "password": "",
             "hardware": "L06A",
             "device_did": "",
+            "conversation_api": "auto",
+            "discovery_all": False,
+            "allow_unlisted_device": False,
             "tts_reply": True,
         },
         "homeassistant": {
@@ -403,6 +420,7 @@ def _set_token(account, cfg: dict):
 
 def _save_auth_and_token(account) -> None:
     """登录成功后保存 auth.json 和 .mi.token（参考 xiaomusic）"""
+    remember_secrets(getattr(account, "token", {}))
     if not hasattr(account, 'token') or not account.token:
         return
     try:
@@ -616,10 +634,9 @@ async def _get_latest_ask_from_xiaoai(session: aiohttp.ClientSession, device_id:
                     return [], last_ts, True  # 需要重新登录
                 continue
             data = await r.json()
-            d = data.get("data")
-            if not d:
+            records = parse_http_records(data)
+            if not records:
                 return [], last_ts, False
-            records = json.loads(d).get("records", [])
             if records:
                 return records, last_ts, False
         except Exception as e:
@@ -648,7 +665,7 @@ async def bridge_loop():
         return
 
     try:
-        from miservice import MiAccount, MiNAService
+        from miservice import MiNAService
     except ImportError:
         bridge_state["error"] = "缺少依赖: pip install miservice"
         bridge_state["running"] = False
@@ -757,27 +774,24 @@ async def bridge_loop():
         if na is None:
             na = MiNAService(account)
 
-        # 获取设备列表
+        # Resolve once. Never silently route a missing clock to another speaker.
         try:
-            devices = await na.device_list()
-            if devices:
-                did = mi_cfg.get("device_did", "")
-                target = None
-                if did:
-                    target = next((d for d in devices if d.get("deviceID") == did or d.get("did") == did), None)
-                if not target:
-                    target = devices[0]
-                hw = target.get("hardware", "")
-                name = target.get("name", "未知")
-                if hw:
-                    mi_cfg["hardware"] = hw
-                    log.info("自动检测到设备: %s (hardware=%s)", name, hw)
-                bridge_state["devices"] = devices
-            else:
-                log.warning("未发现小爱音箱设备")
+            devices = await discover_devices(na, mi_cfg)
+            target = select_target(devices, mi_cfg)
+            device_id = str(target["deviceID"])
+            hardware = target.get("hardware") or mi_cfg.get("hardware", "")
+            mode = conversation_api(mi_cfg, hardware)
+            if mode == "http" and not hardware:
+                raise ValueError("http_requires_observed_hardware")
+            last_timestamp[device_id] = max(last_timestamp.get(device_id, 0), int(time.time() * 1000))
+            mi_cfg["hardware"] = hardware
+            bridge_state["devices"] = public_devices(devices)
+            log.info("设备已明确选择 | conversation_api=%s | experimental_clock_unverified", mode)
         except Exception as e:
-            log.warning("获取设备列表失败: %s，将使用配置中的 hardware", e)
-            devices = []
+            bridge_state["error"] = "设备选择失败，请先运行 diagnose_clock.py 并明确选择 MiNA deviceID"
+            bridge_state["running"] = False
+            log.error("设备选择失败: %s", e)
+            return
 
         # 注入 cookie 到共享 session
         cookies_dict = _get_cookie(cfg)
@@ -803,22 +817,14 @@ async def bridge_loop():
 
         while bridge_state["running"]:
             try:
-                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
-                if not device_id and devices:
-                    device_id = devices[0].get("deviceID", "")
-                if not device_id:
-                    await asyncio.sleep(poll_interval)
-                    continue
-
-                hardware = mi_cfg.get("hardware", "")
                 cur_ts = int(time.time() * 1000)
 
                 # 根据硬件类型选择轮询方式
-                if hardware in GET_ASK_BY_MINA:
+                if mode == "mina":
                     records = await _get_latest_ask_by_mina(na, device_id)
                 else:
                     records, _, need_relogin = await _get_latest_ask_from_xiaoai(
-                        _bridge_session, device_id, hardware or "L06A", cur_ts
+                        _bridge_session, device_id, hardware, cur_ts
                     )
                     if need_relogin:
                         log.info("Token 已过期，尝试重新登录...")
@@ -854,7 +860,7 @@ async def bridge_loop():
                         await asyncio.sleep(poll_interval)
                         continue
 
-                for rec in records or []:
+                for rec in sorted(records or [], key=lambda r: int(r.get("time", r.get("timestamp_ms", 0)) or 0)):
                     # 时间戳去重
                     ts = rec.get("time", rec.get("timestamp_ms", 0))
                     if not ts:
@@ -982,13 +988,13 @@ async def bridge_loop():
                 break
             except Exception as e:
                 log.error("轮询错误: %s", e)
-                bridge_state["error"] = str(e)
+                bridge_state["error"] = type(e).__name__
 
             await asyncio.sleep(poll_interval)
 
     except Exception as e:
         log.error("桥接器启动失败: %s", e)
-        bridge_state["error"] = str(e)
+        bridge_state["error"] = type(e).__name__
     finally:
         bridge_state["running"] = False
         bridge_state["connected"] = False
@@ -1013,18 +1019,7 @@ async def _delayed_call_standalone(ha: HAClient, domain: str, service: str,
 async def _get_latest_ask_by_mina(na, device_id: str) -> list[dict]:
     """Mina 服务方式获取对话（原有逻辑，适配新格式）"""
     try:
-        msgs = await na.get_latest_ask(device_id)
-        records = []
-        for msg in msgs or []:
-            answers = msg.get("response", {}).get("answer", [])
-            if not answers:
-                continue
-            records.append({
-                "time": msg.get("timestamp_ms", 0),
-                "query": answers[0].get("question", ""),
-                "answers": answers,
-            })
-        return records
+        return await fetch_mina_records(na, device_id)
     except Exception as e:
         log.warning("Mina 轮询异常: %s", e)
         return []
@@ -1129,7 +1124,9 @@ EVENT_LOG_PATH = Path("logs/event_monitor.log")
 _event_logger = logging.getLogger("event_monitor")
 _event_logger.setLevel(logging.INFO)
 if not _event_logger.handlers:
-    _event_logger.addHandler(logging.FileHandler(EVENT_LOG_PATH, encoding="utf-8"))
+    _event_handler = logging.FileHandler(EVENT_LOG_PATH, encoding="utf-8")
+    _event_handler.addFilter(SafeLogFilter())
+    _event_logger.addHandler(_event_handler)
 
 # 事件监听 TTS 的缓存实例（避免每次播报都重新登录/获取设备）
 _tts_na = None          # MiNAService 实例
@@ -1148,7 +1145,7 @@ async def _xiaomi_tts(text: str) -> bool:
         return False
     async with _tts_lock:
         try:
-            from miservice import MiAccount, MiNAService
+            from miservice import MiNAService
             from miservice.miaccount import get_random
 
             if _tts_na is None:
@@ -1164,16 +1161,11 @@ async def _xiaomi_tts(text: str) -> bool:
                 account.token = token
                 _tts_na = MiNAService(account)
 
-            # 获取/复用音箱 device_id（优先用配置指定）
-            if not _tts_device_id:
-                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
-                if not device_id:
-                    devices = await _tts_na.device_list()
-                    if devices:
-                        device_id = devices[0].get("deviceID", "")
-                _tts_device_id = device_id
+            # Re-resolve after configuration changes, including a changed target.
+            devices = await discover_devices(_tts_na, mi_cfg)
+            _tts_device_id = str(select_target(devices, mi_cfg)["deviceID"])
 
-            await _tts_na.text_to_speech(_tts_device_id, text)
+            require_ubus_success(await _tts_na.text_to_speech(_tts_device_id, text))
             log.info("🎙️ TTS 播报: %s", text)
             _event_logger.info("TTS 播报: %s", text)
             return True
@@ -1237,7 +1229,7 @@ class EventMonitorEngine:
                 raise
             except Exception as e:
                 self.state["connected"] = False
-                self.state["last_error"] = str(e)[:200]
+                self.state["last_error"] = type(e).__name__[:200]
                 log.warning("事件监听连接异常: %s", e)
                 _event_logger.warning("连接异常: %s", e)
             if self._stop:
@@ -1473,6 +1465,8 @@ async def get_version():
 async def get_config():
     cfg = load_config()
     # 脱敏
+    if cfg.get("xiaomi", {}).get("cookie_text"):
+        cfg["xiaomi"]["cookie_text"] = "••••••••"
     if cfg.get("xiaomi", {}).get("password"):
         cfg["xiaomi"]["password"] = "••••••••"
     if cfg.get("homeassistant", {}).get("token"):
@@ -1496,6 +1490,8 @@ async def post_config(req: SaveConfigRequest):
     existing = load_config()
     # 脱敏字段保留原值
     masked = "••••••••"
+    if cfg.get("xiaomi", {}).get("cookie_text") == masked:
+        cfg["xiaomi"]["cookie_text"] = existing.get("xiaomi", {}).get("cookie_text", "")
     if cfg.get("xiaomi", {}).get("password") == masked:
         cfg["xiaomi"]["password"] = existing.get("xiaomi", {}).get("password", "")
     if cfg.get("homeassistant", {}).get("token") == masked:
@@ -1562,7 +1558,7 @@ _ERROR_HINTS = {
 @app.post("/api/test/xiaomi")
 async def test_xiaomi(req: TestXiaomiRequest):
     try:
-        from miservice import MiAccount, MiNAService
+        from miservice import MiNAService
     except ImportError:
         return {"ok": False, "msg": "缺少依赖: pip install miservice"}
 
@@ -1600,7 +1596,7 @@ async def test_xiaomi(req: TestXiaomiRequest):
                     if await acct0.login("micoapi"):
                         _save_auth_and_token(acct0)
                         na0 = MiNAService(acct0)
-                        devices0 = await na0.device_list()
+                        devices0 = public_devices(await discover_devices(na0, mi))
                         if not devices0:
                             return {"ok": True, "msg": "登录成功，但未发现小爱音箱设备", "devices": []}
                         return {"ok": True, "msg": f"登录成功，发现 {len(devices0)} 台设备",
@@ -1644,7 +1640,7 @@ async def test_xiaomi(req: TestXiaomiRequest):
                     )
                     _save_auth_and_token(acct)
                     na = MiNAService(acct)
-                    devices = await na.device_list()
+                    devices = public_devices(await discover_devices(na, mi))
                     if not mi.get("cookie_text"):
                         save_config({**cfg, "xiaomi": {**mi, "cookie_text": cookie_text}})
                     await cs.close()
@@ -1711,7 +1707,7 @@ async def test_xiaomi(req: TestXiaomiRequest):
 
         _save_auth_and_token(account)
         na = MiNAService(account)
-        devices = await na.device_list()
+        devices = public_devices(await discover_devices(na, mi))
         await s.close()
         if not devices:
             return {"ok": True, "msg": "登录成功，但未发现小爱音箱设备", "devices": []}
@@ -1722,7 +1718,7 @@ async def test_xiaomi(req: TestXiaomiRequest):
         }
     except Exception as e:
         log.exception("test_xiaomi 异常: %s", e)
-        return {"ok": False, "msg": f"请求失败: {e}"}
+        return {"ok": False, "msg": f"请求失败: {type(e).__name__}"}
 
 
 # ──────────────── HA 设备列表 ────────────────
@@ -1749,7 +1745,7 @@ async def get_ha_devices():
                     return {"ok": False, "devices": [], "msg": f"HA 返回 {r.status}"}
                 all_states = await r.json()
     except Exception as e:
-        return {"ok": False, "devices": [], "msg": f"无法连接 HA: {e}"}
+        return {"ok": False, "devices": [], "msg": f"无法连接 HA: {type(e).__name__}"}
 
     # 只保留可控设备（排除 sensor、binary_sensor 等只读类）。
     # 用模块级集合，避免这里和 AI 解析用的白名单各写一份、改一处漏一处。
@@ -2527,7 +2523,7 @@ async def _ai_chat(cfg: dict, system_prompt: str, user_prompt: str,
                         continue
                     if r.status != 200:
                         text = await r.text()
-                        log.warning("AI API 返回 %s: %s", r.status, text[:300])
+                        log.warning("AI API 返回 HTTP %s", r.status)
                         return None
                     data = await r.json()
         except Exception as e:
@@ -2776,8 +2772,8 @@ async def _speak(na, device_id: str, text: str, *,
                     # 打断时可能误停了你正在放的内容，播完接回去
                     asyncio.create_task(_resume_after_speaking(na, device_id))
                 return True
-            log.warning("TTS 返回异常(第%d次): code=%s data.code=%s resp=%s",
-                        attempt, code, dcode, str(resp)[:200])
+            log.warning("TTS 返回异常(第%d次): code=%s data.code=%s",
+                        attempt, code, dcode)
         except Exception as e:
             log.warning("TTS 请求异常(第%d次): %s", attempt, e)
         if attempt == 1:
@@ -2981,11 +2977,11 @@ async def qr_login_start():
         url = f"https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=mijia&deviceId={device_id}&_locale=zh_CN"
         log.info("QR Step1: %s", url[:80])
         try:
-            async with s.get(url, headers=headers, ssl=False) as r:
+            async with s.get(url, headers=headers, ssl=True) as r:
                 raw = await r.read()
         except Exception as e:
             await s.close()
-            return {"ok": False, "msg": f"无法连接小米服务器: {e}"}
+            return {"ok": False, "msg": f"无法连接小米服务器: {type(e).__name__}"}
 
         # 尝试解析响应（去掉可能的 &&& 前缀）
         text = raw.decode("utf-8", errors="replace")
@@ -2993,7 +2989,7 @@ async def qr_login_start():
             service_data = json.loads(text) if text.startswith("{") else json.loads(text[11:])
         except Exception:
             await s.close()
-            return {"ok": False, "msg": f"小米返回异常: {text[:200]}"}
+            return {"ok": False, "msg": "小米返回无法解析的登录响应"}
 
         log.info("QR Step1 resp: code=%s", service_data.get("code"))
         if service_data.get("code") == 0:
@@ -3010,18 +3006,18 @@ async def qr_login_start():
         login_url = "https://account.xiaomi.com/longPolling/loginUrl"
         full_url = login_url + "?" + location.split("?")[1] if "?" in location else login_url + "?" + location
         try:
-            async with s.get(full_url, headers=headers, ssl=False) as r:
+            async with s.get(full_url, headers=headers, ssl=True) as r:
                 raw = await r.read()
         except Exception as e:
             await s.close()
-            return {"ok": False, "msg": f"获取二维码网络失败: {e}"}
+            return {"ok": False, "msg": f"获取二维码网络失败: {type(e).__name__}"}
 
         text = raw.decode("utf-8", errors="replace")
         try:
             login_data = json.loads(text) if text.startswith("{") else json.loads(text[11:])
         except Exception:
             await s.close()
-            return {"ok": False, "msg": f"二维码接口返回异常: {text[:200]}"}
+            return {"ok": False, "msg": "二维码接口返回无法解析的响应"}
 
         await s.close()
         qr_url = login_data.get("qr", login_data.get("loginUrl", ""))
@@ -3036,7 +3032,7 @@ async def qr_login_start():
         return {"ok": True, "qr_url": qr_url, "msg": "请用米家 App 扫描二维码"}
     except Exception as e:
         log.exception("QR 登录异常: %s", e)
-        return {"ok": False, "msg": f"QR 登录失败: {e}"}
+        return {"ok": False, "msg": f"QR 登录失败: {type(e).__name__}"}
 
 
 @app.get("/api/qr/poll")
@@ -3053,20 +3049,20 @@ async def qr_login_poll():
     s = aiohttp.ClientSession()
     try:
         timeout = aiohttp.ClientTimeout(total=8)
-        async with s.get(lp_url, headers=headers, ssl=False, timeout=timeout) as r:
+        async with s.get(lp_url, headers=headers, ssl=True, timeout=timeout) as r:
             raw = await r.read()
         text = raw.decode("utf-8", errors="replace")
         try:
             lp_data = json.loads(text) if text.startswith("{") else json.loads(text[11:])
         except Exception:
             await s.close()
-            return {"ok": False, "done": False, "msg": f"轮询异常: {text[:100]}"}
+            return {"ok": False, "done": False, "msg": "扫码轮询返回无法解析的响应"}
         # 检查是否扫码成功
         if lp_data.get("psecurity") and lp_data.get("userId"):
             # Step 3: 获取 serviceToken
             callback_url = lp_data.get("location", "")
             if callback_url:
-                async with s.get(callback_url, headers=headers, ssl=False) as r:
+                async with s.get(callback_url, headers=headers, ssl=True) as r:
                     pass
             sts_cookies = {k: v.value for k, v in
                            s.cookie_jar.filter_cookies(
@@ -3098,7 +3094,9 @@ async def qr_login_poll():
             cfg.setdefault("xiaomi", {})["cookie_text"] = cookie_text
             save_config(cfg)
             _qr_state.clear()
-            log.info("QR 扫码登录成功! userId=%s", auth_data["userId"])
+            remember_secrets(auth_data)
+            remember_secrets(token_data)
+            log.info("QR 扫码登录成功")
             await s.close()
             return {"ok": True, "done": True, "msg": f"扫码登录成功! userId={auth_data['userId']}"}
         else:
@@ -3112,7 +3110,7 @@ async def qr_login_poll():
         if "401" in str(e) or "timeout" in str(e).lower():
             return {"ok": True, "done": False, "msg": "等待扫码中..."}
         log.warning("QR 轮询异常: %s", e)
-        return {"ok": False, "done": False, "msg": f"轮询错误: {e}"}
+        return {"ok": False, "done": False, "msg": f"轮询错误: {type(e).__name__}"}
 
 
 class TestHARequest(BaseModel):
@@ -3151,7 +3149,7 @@ async def get_ha_services(req: TestHARequest):
                     return {"ok": True, "services": services}
                 return {"ok": False, "msg": f"请求失败: {r.status}"}
         except Exception as e:
-            return {"ok": False, "msg": f"请求异常: {e}"}
+            return {"ok": False, "msg": f"请求异常: {type(e).__name__}"}
 
 
 class TestRuleRequest(BaseModel):
@@ -3204,7 +3202,7 @@ async def test_rule(req: TestRuleRequest):
                 delayed_runner=lambda h, d, sv, data, sec, _sess:
                     _delayed_call_standalone(h, d, sv, data, sec))
     except Exception as e:
-        return {"matched": True, "executed": False, "msg": f"HA 调用异常: {e}",
+        return {"matched": True, "executed": False, "msg": f"HA 调用异常: {type(e).__name__}",
                 "action": actions[0], "ai_used": diag.get("ai_used", False)}
 
     ok_count = sum(1 for r in results if r["ok"])
@@ -3341,7 +3339,7 @@ async def tts_speak(req: TTSRequest):
         raise HTTPException(400, "小米账号未登录，请打开配置页扫码登录")
     
     try:
-        from miservice import MiAccount, MiNAService
+        from miservice import MiNAService
         from miservice.miaccount import get_random
         
         token_path = CONFIG_PATH.parent / ".mi.token"
@@ -3355,19 +3353,16 @@ async def tts_speak(req: TTSRequest):
             account.token = token
             
             na = MiNAService(account)
-            devices = await na.device_list()
-            
-            device_id = ""
-            if devices:
-                device_id = devices[0].get("deviceID", "")
-            
-            await na.text_to_speech(device_id, req.text)
+            devices = await discover_devices(na, mi_cfg)
+            device_id = str(select_target(devices, mi_cfg)["deviceID"])
+
+            require_ubus_success(await na.text_to_speech(device_id, req.text))
             log.info("TTS 播报: %s", req.text)
             
-            return {"ok": True, "msg": f"已播报: {req.text}"}
+            return {"ok": True, "msg": "API 已接受播报请求，请在目标设备确认实际声音"}
     except Exception as e:
         log.error("TTS 播报失败: %s", e)
-        raise HTTPException(500, f"TTS 播报失败: {e}")
+        raise HTTPException(500, f"TTS 播报失败: {type(e).__name__}")
 
 
 # ──────────────── 版本更新 ────────────────
@@ -3471,6 +3466,8 @@ async def update_apply():
 
     任何一步失败都不动现有文件；写入过程中出错则从备份回滚。
     """
+    if "experimental" in VERSION:
+        raise HTTPException(400, "实验分支请通过 Git 与重建镜像更新，避免覆盖实验模块")
     cfg = load_config()
     info = await _check_update(cfg)
     if not info.get("ok"):
@@ -3542,7 +3539,7 @@ async def update_apply():
             except Exception:
                 pass
         log.error("更新写入失败，已尝试回滚: %s", e)
-        raise HTTPException(500, f"写入失败，已回滚到 v{VERSION}：{e}")
+        raise HTTPException(500, f"写入失败，已回滚到 v{VERSION}：{type(e).__name__}")
 
     log.info("已更新到 v%s，进程即将退出，由 Docker 重启", latest)
     # 等响应发出去再退出；restart: unless-stopped 会把容器拉起来

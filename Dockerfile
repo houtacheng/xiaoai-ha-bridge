@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bridge.py .
+COPY bridge.py xiaoai_compat.py diagnose_clock.py ./
 COPY web/ web/
 RUN mkdir -p config logs
 
