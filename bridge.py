@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1-ai01zm-experimental.4"
+VERSION = "3.12.1-ai01zm-experimental.5"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -652,6 +652,8 @@ async def bridge_loop():
     cfg = load_config()
     mi_cfg = cfg.get("xiaomi", {})
     ha_cfg = cfg.get("homeassistant", {})
+    clock_mode = mi_cfg.get("conversation_api") == "mijia_aivs"
+    clock_dry_run = clock_mode and mi_cfg.get("clock_bridge_dry_run", True)
 
     # 账号密码不再是必须的：扫码登录只留下 auth.json / .mi.token / cookie_text，
     # 而 passToken 登录路径完全不依赖账号密码（见 miservice MiAccount.login）。
@@ -661,7 +663,7 @@ async def bridge_loop():
         await _notify_xiaomi_offline(cfg, "配置中没有可用的小米账号登录凭据（passToken / cookie）")
         return
 
-    if not ha_cfg.get("token"):
+    if not ha_cfg.get("token") and not clock_dry_run:
         bridge_state["error"] = "Home Assistant Token 未配置"
         bridge_state["running"] = False
         return
@@ -674,8 +676,8 @@ async def bridge_loop():
         return
 
     parser = IntentParser(cfg.get("intent_rules", []))
-    ha = HAClient(ha_cfg["url"], ha_cfg["token"])
-    poll_interval = cfg.get("poll_interval_seconds", 2)
+    ha = HAClient(ha_cfg.get("url", ""), ha_cfg.get("token", ""))
+    poll_interval = max(3, cfg.get("poll_interval_seconds", 2)) if clock_mode else cfg.get("poll_interval_seconds", 2)
 
     # 基于时间戳的去重，key=device_id — 持久化到文件，避免重启重复执行
     LAST_TS_PATH = CONFIG_PATH.parent / "last_timestamp.json"
@@ -685,115 +687,137 @@ async def bridge_loop():
             last_timestamp = json.loads(LAST_TS_PATH.read_text())
         except Exception:
             last_timestamp = {}
-    log.info("上次记录时间戳: %s", last_timestamp)
+    log.info("已載入 %d 台設備的去重狀態", len(last_timestamp))
 
     _bridge_session = aiohttp.ClientSession()
     try:
         from miservice.miaccount import get_random
 
-        # ── 登录（三级尝试，参考 xiaomusic 的 passToken 注入绕过 SMS） ──
-        account = MiAccount(_bridge_session, mi_cfg.get("username") or "", mi_cfg.get("password") or "",
-                           str(TOKEN_PATH) if TOKEN_PATH.parent.exists() else None)
-        _set_token(account, cfg)
-
-        if not isinstance(account.token, dict):
-            account.token = {'deviceId': get_random(16).upper()}
-
-        na = None
-        logged_in = False
-
-        # 尝试1: 用 passToken 绕过密码步骤（xiaomusic 做法，不需要 SMS）
-        if account.token.get('passToken'):
-            log.info("尝试 passToken 登录...")
-            try:
-                ok = await account.login("micoapi")
-                if ok:
-                    logged_in = True
-            except Exception as e:
-                log.warning("passToken 登录异常: %s，尝试其他方式", e)
-
-        # 尝试2: Cookie 注入到 session 再直接调 device_list
-        if not logged_in:
-            cookie_text = mi_cfg.get("cookie_text", "")
-            if cookie_text:
-                log.info("尝试 Cookie 注入登录...")
-                try:
-                    from http.cookies import SimpleCookie
-                    sc = SimpleCookie()
-                    sc.load(cookie_text)
-                    cookies = {k: m.value for k, m in sc.items()}
-                    if cookies.get('userId') and (cookies.get('passToken') or cookies.get('serviceToken')):
-                        import yarl
-                        sc2 = SimpleCookie()
-                        for k, v in cookies.items():
-                            try:
-                                sc2[k] = v
-                            except Exception:
-                                pass
-                        for domain in ['account.xiaomi.com', '.mina.mi.com']:
-                            _bridge_session.cookie_jar.update_cookies(sc2, yarl.URL(f'https://{domain}/'))
-                        account2 = MiAccount(_bridge_session, mi_cfg.get("username") or "", mi_cfg.get("password") or "", str(TOKEN_PATH))
-                        account2.token = {
-                            'deviceId': cookies.get('deviceId', get_random(16).upper()),
-                            'userId': cookies['userId'],
-                            'passToken': cookies.get('passToken', ''),
-                        }
-                        resp = await account2._serviceLogin('serviceLogin?sid=micoapi&_json=true')
-                        if resp.get('code') != 0:
-                            raise Exception(f"Cookie 验证失败: {resp.get('description','')}")
-                        account2.token['userId'] = str(resp.get('userId', account2.token['userId']))
-                        account2.token['micoapi'] = (
-                            resp.get('psecurity', resp.get('ssecurity', '')),
-                            cookies.get('serviceToken', ''),
-                        )
-                        account = account2
-                        na = MiNAService(account)
-                        _save_auth_and_token(account)
-                        logged_in = True
-                        log.info("Cookie 注入登录成功")
-                except Exception as e:
-                    log.warning("Cookie 注入失败: %s", e)
-
-        # 尝试3: 密码登录（会触发 SMS 验证）
-        if not logged_in:
-            log.info("尝试密码登录...")
-            try:
-                ok = await account.login("micoapi")
-                if ok:
-                    logged_in = True
-            except Exception as e:
-                log.warning("密码登录异常: %s", e)
-
-        if not logged_in:
-            bridge_state["error"] = ("登录失败，请打开配置页面 → 在「Cookie 登录」输入框中粘贴浏览器 Cookie → 点测试连接。"
-                                     "Cookie 获取方法：浏览器打开 account.xiaomi.com → F12 → Application → Cookies → 复制全部")
-            bridge_state["running"] = False
-            await _notify_xiaomi_offline(cfg, "小米账号登录失败（passToken / Cookie / 密码三种方式均未成功）")
-            return
-
-        # 保存 token
-        _save_auth_and_token(account)
-        if na is None:
-            na = MiNAService(account)
-
-        # Resolve once. Never silently route a missing clock to another speaker.
-        try:
-            devices = await discover_devices(na, mi_cfg)
-            target = select_target(devices, mi_cfg)
-            device_id = str(target["deviceID"])
-            hardware = target.get("hardware") or mi_cfg.get("hardware", "")
-            mode = conversation_api(mi_cfg, hardware)
-            if mode == "http" and not hardware:
-                raise ValueError("http_requires_observed_hardware")
+        if clock_mode:
+            from miservice import MiIOService
+            from clock_profile import select_clock, fetch_clock_history
+            account = MiAccount(_bridge_session, mi_cfg.get("username") or "", mi_cfg.get("password") or "", None)
+            _set_token(account, cfg)
+            if not await account.login("xiaomiio"):
+                raise ValueError("clock_xiaomiio_login_failed")
+            io = MiIOService(account, region=mi_cfg.get("region", "cn"))
+            target = select_clock(await io.device_list(name="full"), mi_cfg.get("clock_did", ""))
+            clock_did = str(target["did"])
+            # Separate namespace: this is a Mi Home route, never a MiNA deviceID.
+            device_id = "aivs:" + clock_did
+            hardware = ""
+            mode = "mijia_aivs"
+            na = None
+            devices = []
+            mi_cfg["tts_reply"] = False
             last_timestamp[device_id] = max(last_timestamp.get(device_id, 0), int(time.time() * 1000))
-            mi_cfg["hardware"] = hardware
-            bridge_state["devices"] = public_devices(devices)
-            log.info("设备已明确选择 | conversation_api=%s | experimental_clock_unverified", mode)
-        except Exception as e:
-            bridge_state["error"] = "设备选择失败，请先运行 diagnose_clock.py 并明确选择 MiNA deviceID"
-            bridge_state["running"] = False
-            log.error("设备选择失败: %s", e)
-            return
+            bridge_state["clock_profile"] = {"model": "zimi.clock.myk01", "dry_run": clock_dry_run,
+                                              "new_voice_count": 0, "last_voice_time": None, "ha_test_count": 0}
+            log.info("AI01ZM 米家對話路徑已選定 | dry_run=%s | TTS 尚未驗證", clock_dry_run)
+        else:
+            # ── 登录（三级尝试，参考 xiaomusic 的 passToken 注入绕过 SMS） ──
+            account = MiAccount(_bridge_session, mi_cfg.get("username") or "", mi_cfg.get("password") or "",
+                               str(TOKEN_PATH) if TOKEN_PATH.parent.exists() else None)
+            _set_token(account, cfg)
+
+            if not isinstance(account.token, dict):
+                account.token = {'deviceId': get_random(16).upper()}
+
+            na = None
+            logged_in = False
+
+            # 尝试1: 用 passToken 绕过密码步骤（xiaomusic 做法，不需要 SMS）
+            if account.token.get('passToken'):
+                log.info("尝试 passToken 登录...")
+                try:
+                    ok = await account.login("micoapi")
+                    if ok:
+                        logged_in = True
+                except Exception as e:
+                    log.warning("passToken 登录异常: %s，尝试其他方式", e)
+
+            # 尝试2: Cookie 注入到 session 再直接调 device_list
+            if not logged_in:
+                cookie_text = mi_cfg.get("cookie_text", "")
+                if cookie_text:
+                    log.info("尝试 Cookie 注入登录...")
+                    try:
+                        from http.cookies import SimpleCookie
+                        sc = SimpleCookie()
+                        sc.load(cookie_text)
+                        cookies = {k: m.value for k, m in sc.items()}
+                        if cookies.get('userId') and (cookies.get('passToken') or cookies.get('serviceToken')):
+                            import yarl
+                            sc2 = SimpleCookie()
+                            for k, v in cookies.items():
+                                try:
+                                    sc2[k] = v
+                                except Exception:
+                                    pass
+                            for domain in ['account.xiaomi.com', '.mina.mi.com']:
+                                _bridge_session.cookie_jar.update_cookies(sc2, yarl.URL(f'https://{domain}/'))
+                            account2 = MiAccount(_bridge_session, mi_cfg.get("username") or "", mi_cfg.get("password") or "", str(TOKEN_PATH))
+                            account2.token = {
+                                'deviceId': cookies.get('deviceId', get_random(16).upper()),
+                                'userId': cookies['userId'],
+                                'passToken': cookies.get('passToken', ''),
+                            }
+                            resp = await account2._serviceLogin('serviceLogin?sid=micoapi&_json=true')
+                            if resp.get('code') != 0:
+                                raise Exception(f"Cookie 验证失败: {resp.get('description','')}")
+                            account2.token['userId'] = str(resp.get('userId', account2.token['userId']))
+                            account2.token['micoapi'] = (
+                                resp.get('psecurity', resp.get('ssecurity', '')),
+                                cookies.get('serviceToken', ''),
+                            )
+                            account = account2
+                            na = MiNAService(account)
+                            _save_auth_and_token(account)
+                            logged_in = True
+                            log.info("Cookie 注入登录成功")
+                    except Exception as e:
+                        log.warning("Cookie 注入失败: %s", e)
+
+            # 尝试3: 密码登录（会触发 SMS 验证）
+            if not logged_in:
+                log.info("尝试密码登录...")
+                try:
+                    ok = await account.login("micoapi")
+                    if ok:
+                        logged_in = True
+                except Exception as e:
+                    log.warning("密码登录异常: %s", e)
+
+            if not logged_in:
+                bridge_state["error"] = ("登录失败，请打开配置页面 → 在「Cookie 登录」输入框中粘贴浏览器 Cookie → 点测试连接。"
+                                         "Cookie 获取方法：浏览器打开 account.xiaomi.com → F12 → Application → Cookies → 复制全部")
+                bridge_state["running"] = False
+                await _notify_xiaomi_offline(cfg, "小米账号登录失败（passToken / Cookie / 密码三种方式均未成功）")
+                return
+
+            # 保存 token
+            _save_auth_and_token(account)
+            if na is None:
+                na = MiNAService(account)
+
+            # Resolve once. Never silently route a missing clock to another speaker.
+            try:
+                devices = await discover_devices(na, mi_cfg)
+                target = select_target(devices, mi_cfg)
+                device_id = str(target["deviceID"])
+                hardware = target.get("hardware") or mi_cfg.get("hardware", "")
+                mode = conversation_api(mi_cfg, hardware)
+                if mode == "http" and not hardware:
+                    raise ValueError("http_requires_observed_hardware")
+                last_timestamp[device_id] = max(last_timestamp.get(device_id, 0), int(time.time() * 1000))
+                mi_cfg["hardware"] = hardware
+                bridge_state["devices"] = public_devices(devices)
+                log.info("设备已明确选择 | conversation_api=%s | experimental_clock_unverified", mode)
+            except Exception as e:
+                bridge_state["error"] = "设备选择失败，请先运行 diagnose_clock.py 并明确选择 MiNA deviceID"
+                bridge_state["running"] = False
+                log.error("设备选择失败: %s", e)
+                return
 
         # 注入 cookie 到共享 session
         cookies_dict = _get_cookie(cfg)
@@ -809,9 +833,9 @@ async def bridge_loop():
             for domain in ['account.xiaomi.com', '.mina.mi.com']:
                 _bridge_session.cookie_jar.update_cookies(sc, yarl.URL(f'https://{domain}/'))
 
-        ha_ok = await ha.test_connection(_bridge_session)
+        ha_ok = False if clock_dry_run else await ha.test_connection(_bridge_session)
         bridge_state["connected"] = ha_ok
-        if not ha_ok:
+        if not ha_ok and not clock_dry_run:
             log.warning("Home Assistant 连接失败，请检查地址和 Token")
 
         log.info("桥接器已启动 | 轮询间隔 %ss | HA %s", poll_interval, "✓" if ha_ok else "✗")
@@ -822,7 +846,14 @@ async def bridge_loop():
                 cur_ts = int(time.time() * 1000)
 
                 # 根据硬件类型选择轮询方式
-                if mode == "mina":
+                if mode == "mijia_aivs":
+                    if not isinstance(account.token, dict) or not account.token.get("xiaomiio"):
+                        _set_token(account, cfg)
+                        if not await account.login("xiaomiio"):
+                            raise ValueError("clock_xiaomiio_relogin_failed")
+                    records = await fetch_clock_history(io, clock_did, cur_ts)
+                    bridge_state["error"] = None
+                elif mode == "mina":
                     records = await _get_latest_ask_by_mina(na, device_id)
                 else:
                     records, _, need_relogin = await _get_latest_ask_from_xiaoai(
@@ -869,6 +900,8 @@ async def bridge_loop():
                         log.warning("轮询记录缺少 time 字段, rec keys=%s", list(rec.keys())[:5])
                         continue
                     ts = int(ts)
+                    if clock_mode and not int(time.time() * 1000) - 30000 <= ts <= int(time.time() * 1000) + 30000:
+                        continue
                     if ts <= last_timestamp.get(device_id, 0):
                         log.debug("跳过旧记录 ts=%s <= last=%s", ts, last_timestamp.get(device_id, 0))
                         continue
@@ -881,8 +914,31 @@ async def bridge_loop():
                     if not query:
                         log.debug("跳过空查询记录 ts=%s answer=%s", ts, (answer or '')[:40])
                         continue
-                    log.info("🎤 用户: %s", query)
-                    if answer:
+                    if clock_mode:
+                        state = bridge_state["clock_profile"]
+                        state["new_voice_count"] += 1
+                        state["last_voice_time"] = ts
+                        log.info("AI01ZM 收到新語音 | chars=%d | dry_run=%s", len(query), clock_dry_run)
+                        if clock_dry_run:
+                            continue
+                        if mi_cfg.get("clock_bridge_test_only", False):
+                            entity = mi_cfg.get("clock_test_entity", "")
+                            if not re.fullmatch(r"input_boolean\.xiaoai_ai01zm_bridge_test[a-z0-9_]*", entity):
+                                raise ValueError("clock_test_entity_invalid")
+                            # Only these two deliberate phrases can affect this task's virtual helper.
+                            phrase = re.sub(r"[\s，,。.!！?？]", "", query)
+                            phrase = re.sub(r"^(小爱同学|小愛同學)", "", phrase)
+                            service = {"打开桥接测试": "turn_on", "打開橋接測試": "turn_on",
+                                       "关闭桥接测试": "turn_off", "關閉橋接測試": "turn_off"}.get(phrase)
+                            if service:
+                                ok = await ha.call_service("input_boolean", service, {"entity_id": entity}, _bridge_session)
+                                state["ha_test_count"] += int(ok)
+                                state["ha_test_last_result"] = bool(ok)
+                                state["ha_test_last_state"] = "on" if service == "turn_on" else "off"
+                            continue
+                    else:
+                        log.info("🎤 用户: %s", query)
+                    if answer and not clock_mode:
                         log.info("🤖 小爱: %s", answer)
 
                     # ── 唤醒词残片：只喊了一声"小爱同学"，不值得走一次 LLM ──
@@ -913,7 +969,7 @@ async def bridge_loop():
                                 clar_actions, ha, na, _bridge_session,
                                 device_id=device_id,
                                 tts_reply=mi_cfg.get("tts_reply", True),
-                                interrupt_reply=_interrupt_enabled(rt_cfg))
+                                interrupt_reply=False if clock_mode else _interrupt_enabled(rt_cfg))
                             await _conversation.record_turn(
                                 query, clar_actions, results, _cached_devices())
                             bridge_state["last_command"] = query
@@ -978,7 +1034,7 @@ async def bridge_loop():
                         actions, ha, na, _bridge_session,
                         device_id=device_id,
                         tts_reply=mi_cfg.get("tts_reply", True),
-                        interrupt_reply=_interrupt_enabled(rt_cfg))
+                        interrupt_reply=False if clock_mode else _interrupt_enabled(rt_cfg))
                     await _conversation.record_turn(
                         query, actions, results, _cached_devices())
 
@@ -1741,6 +1797,33 @@ async def clock_diagnostics():
     except Exception as e:
         return {"ok": False, "msg": "鬧鐘狀態讀取未完成", "error_type": type(e).__name__,
                 "voice_control_verified": False}
+
+
+@app.post("/api/clock/prepare")
+async def prepare_clock_bridge():
+    from miservice import MiIOService
+    from clock_profile import select_clock
+    cfg = load_config()
+    mi = cfg.setdefault("xiaomi", {})
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            account = MiAccount(session, mi.get("username") or "", mi.get("password") or "", None)
+            _set_token(account, cfg)
+            target = select_clock(await MiIOService(account, region=mi.get("region", "cn")).device_list(name="full"), mi.get("clock_did", ""))
+        previous_task = _bridge_task
+        await stop_bridge()
+        if previous_task and not previous_task.done():
+            try:
+                await previous_task
+            except asyncio.CancelledError:
+                pass
+        mi.update(clock_did=str(target["did"]), conversation_api="mijia_aivs", clock_bridge_dry_run=True, tts_reply=False)
+        cfg["interrupt_native_reply"] = False
+        save_config(cfg)
+        await start_bridge()
+        return {"ok": True, "dry_run": True, "msg": "已選定 AI01ZM，僅監聽啟動後的新語音，不執行 HA 控制"}
+    except Exception as e:
+        return {"ok": False, "msg": "無法唯一選定在線 AI01ZM", "error_type": type(e).__name__}
 
 
 # ──────────────── HA 设备列表 ────────────────
@@ -2772,7 +2855,7 @@ async def _speak(na, device_id: str, text: str, *,
     interrupt=True 先打断小爱当前播报（快，但可能误停音乐）；
     wait_silent=True 则等它说完（慢，约 5-8 秒，但绝对安全）。
     """
-    if not text:
+    if not text or na is None:
         return False
     stopped_something = False
     if interrupt:

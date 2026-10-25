@@ -10,7 +10,9 @@ xiaomi:
   hardware: L06A
   device_did: ''
   # 实验功能：不推断 AI01ZM / zimi.clock.myk01 的 MiNA hardware
-  conversation_api: auto  # auto / mina / http；逐一诊断后明确选择
+  conversation_api: auto  # auto / mina / http / mijia_aivs（AI01ZM）
+  clock_did: ''          # 僅限米家 AI01ZM 路徑；與 MiNA deviceID 分開
+  clock_bridge_dry_run: true  # 初次只監聽新語音，不呼叫 HA
   discovery_all: false   # true 时额外查询 master=1
   device_id: ''          # 仅填实际 MiNA deviceID；不是米家 did
   allow_unlisted_device: false  # 仅在本机已取得 MiNA ID 时手动实验

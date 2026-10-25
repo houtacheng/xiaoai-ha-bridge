@@ -770,7 +770,7 @@ body{
         <div class="card-head"><div class="card-title"><span>&#9881;</span>设备参数</div></div>
         <div class="form-grid">
           <div class="field"><label>音箱型号</label><input type="text" id="mi-hardware" placeholder="测试连接自动填充"></div>
-          <div class="field"><label>对话 API（闹钟实验功能，尚未实机验证）</label><select id="mi-conversation-api"><option value="auto">自动（保留原有型号规则）</option><option value="mina">MiNA / mibrain nlp_result_get</option><option value="http">HTTP / conversation</option></select></div>
+          <div class="field"><label>对话 API（闹钟实验功能，尚未实机验证）</label><select id="mi-conversation-api"><option value="auto">自动（保留原有型号规则）</option><option value="mina">MiNA / mibrain nlp_result_get</option><option value="http">HTTP / conversation</option><option value="mijia_aivs">AI01ZM 米家對話紀錄（實驗）</option></select></div>
           <label><input type="checkbox" id="mi-discovery-all"> 同时查询 MiNA master=1 清单（不保证包含闹钟）</label>
           <div class="field"><label>设备 DID</label><input type="text" id="mi-did" placeholder="点击设备自动填入"></div>
           <div class="field full"><div class="toggle-wrap"><label class="toggle"><input type="checkbox" id="mi-tts" checked><div class="toggle-track"></div><div class="toggle-thumb"></div></label><span class="toggle-label">TTS语音反馈</span></div></div>
@@ -1237,8 +1237,18 @@ async function diagnoseClock(){
       const system=checks.hourly_system&&checks.hourly_system.status==='ok'?checks.hourly_system.value+' 小時制':'未讀取';
       const state=clock.status==='read_only_verified'?'已連線，狀態讀取通過':clock.online===false?'離線':'已辨識，狀態尚未完整讀取';
       return '<div class="rule-item"><b>'+escHtml(clock.name||'小愛智能鬧鐘')+'</b><div>'+escHtml(clock.model)+' · '+escHtml(state)+'</div><div>音量：'+escHtml(volume)+' · '+escHtml(system)+'</div></div>';
-    }).join('')+'<div style="margin-top:12px;color:var(--txt-muted)">已辨識米家鬧鐘；語音控制 HA 與 TTS 尚未驗證。這些紀錄不會填入 MiNA 設備 ID。</div>';
+    }).join('')+'<div style="margin-top:12px;color:var(--txt-muted)">已辨識米家鬧鐘；HA 控制與 TTS 尚未驗證。米家對話讀取使用獨立路徑，不填入 MiNA 設備 ID。</div><button class="btn" style="margin-top:12px" onclick="prepareClockBridge()">選取在線鬧鐘並測試新語音（不控制設備）</button>';
   }catch(e){box.textContent='讀取暫時失敗，請稍後重試'}
+}
+
+async function prepareClockBridge(){
+  const a=document.getElementById('xiaomi-alert');
+  showAlert(a,'warn','正在選定鬧鐘並啟動新語音測試…');
+  try{
+    const r=await fetch('/api/clock/prepare',{method:'POST'});const d=await r.json();
+    showAlert(a,d.ok?'ok':'err',d.msg||'準備未完成');
+    if(d.ok){await loadConfig()}
+  }catch(e){showAlert(a,'err','準備未完成，請重試')}
 }
 
 function escAttr(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;')}
