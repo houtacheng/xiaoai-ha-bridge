@@ -1,6 +1,6 @@
 # AI01ZM 能力與實測範圍
 
-目標型號：AI01ZM / zimi.clock.myk01。語音控制 HA 仍未驗證。
+目標型號：AI01ZM / zimi.clock.myk01。experimental.6 已在使用者設備通過一輪新語音控制 HA 專用虛擬開關 on/off；完整相容性仍待驗證。以下版本段落保留各階段研究結果。
 
 `experimental.4` 新增此型號的獨立只讀狀態設定檔，從米家中國區辨識型號，透過已驗證的 xiaomiio SID 讀取 `get_volume` 與 `get_hourly_system`。離線紀錄不送 RPC；所有結果採白名單，不回傳 did、token、MAC 或 IP。這條路徑不會把米家 did 填成 MiNA deviceID，不包含改音量、改鬧鈴或播放音訊的命令。
 
@@ -27,3 +27,9 @@
 實機 HA 驗證可設定 `clock_bridge_test_only: true` 及專用 `clock_test_entity`。這個模式只接受「打开桥接测试／关闭桥接测试」及繁體對應語句，且只能操作本次建立、ID 以 `input_boolean.xiaoai_ai01zm_bridge_test` 開頭的單一合法測試輔助開關，不會執行其餘日常規則。原有 7 條規則保留。完整測試通過後才將 dry run 與 test only 關閉，正式使用原有規則。
 
 測試增為 42 項 Python 測試，涵蓋專用請求格式、角色過濾、時間順序、設備固定、dry run 無 HA 呼叫，以及僅操作測試開關。TTS 與鬧鈴管理沒有因此宣稱支援。
+
+## experimental.6：專用 HA 開關一輪實測通過
+
+2026-10-25，QNAP 部署 fef7ea7。使用者在啟動 test_helper 模式後說出開、關指令，安全摘要為 new_voice_count=2、ha_test_count=2。獨立從 HA 狀態讀取觀測到 off → on → off，最後為 off、橋接執行中且 HA 已連線。這確認實體語音到 HA 的基本路徑，不能由 HTTP 成功次數單獨推論。
+
+新版分開「僅測收音」與「開始 HA 虛擬開關測試」，並顯示實際 HA 狀態。增加「打開測試開關／關閉測試開關」及繁體對應。48 項 Python 測試在本機與 QNAP 新映像皆通過；3 個前端 QR 排程情境通過。詳細實測範圍見 HARDWARE-RESULTS.md。TTS、重啟／重新登入及日常規則未因此宣稱通過。
