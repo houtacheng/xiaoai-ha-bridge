@@ -953,7 +953,7 @@ body{
 // ═══════════ State ═══════════
 let cfg = {};
 let autoScroll = true;
-let logTimer = null, statusTimer = null, qrPollTimer = null, qrGeneration = 0, qrStarting = false;
+let logTimer = null, statusTimer = null, qrPollTimer = null, qrGeneration = 0, qrStarting = false, clockTestTimer = null;
 let deviceAliases = {};
 let deviceCache = [], deviceTypeFilter = 'all';
 let pickerDevices = null, pickerTarget = null;
@@ -1237,7 +1237,9 @@ async function diagnoseClock(){
       const system=checks.hourly_system&&checks.hourly_system.status==='ok'?checks.hourly_system.value+' 小時制':'未讀取';
       const state=clock.status==='read_only_verified'?'已連線，狀態讀取通過':clock.online===false?'離線':'已辨識，狀態尚未完整讀取';
       return '<div class="rule-item"><b>'+escHtml(clock.name||'小愛智能鬧鐘')+'</b><div>'+escHtml(clock.model)+' · '+escHtml(state)+'</div><div>音量：'+escHtml(volume)+' · '+escHtml(system)+'</div></div>';
-    }).join('')+'<div style="margin-top:12px;color:var(--txt-muted)">已辨識米家鬧鐘；HA 控制與 TTS 尚未驗證。米家對話讀取使用獨立路徑，不填入 MiNA 設備 ID。</div><button class="btn" style="margin-top:12px" onclick="prepareClockBridge()">選取在線鬧鐘並測試新語音（不控制設備）</button>';
+    }).join('')+'<div style="margin-top:12px;color:var(--txt-muted)">已辨識米家鬧鐘；HA 控制與 TTS 尚未驗證。米家對話讀取使用獨立路徑，不填入 MiNA 設備 ID。</div><button class="btn" style="margin-top:12px" onclick="prepareClockBridge()">僅測收音（HA 不執行）</button><button class="btn btn-primary" style="margin-top:12px" onclick="startClockHelperTest()">開始 HA 虛擬開關測試</button><div id="clock-test-state" style="margin-top:12px;line-height:1.8"></div>';
+    await refreshClockTestState();
+    if(!clockTestTimer)clockTestTimer=setInterval(refreshClockTestState,5000);
   }catch(e){box.textContent='讀取暫時失敗，請稍後重試'}
 }
 
@@ -1249,6 +1251,29 @@ async function prepareClockBridge(){
     showAlert(a,d.ok?'ok':'err',d.msg||'準備未完成');
     if(d.ok){await loadConfig()}
   }catch(e){showAlert(a,'err','準備未完成，請重試')}
+}
+
+async function refreshClockTestState(){
+  const box=document.getElementById('clock-test-state');
+  const page=document.getElementById('page-xiaomi');
+  if(!box||!page.classList.contains('active'))return;
+  try{
+    const r=await fetch('/api/clock/test-state');const s=await r.json();
+    const mode=s.mode==='receive_only'?'僅收音：HA 不會執行':s.mode==='test_helper'?'HA 虛擬開關測試：不控制實體設備':'現有 HA 規則';
+    const state=s.helper_state==='on'?'開啟（on）':s.helper_state==='off'?'關閉（off）':'無法讀取';
+    box.textContent='目前模式：'+mode+' ｜ '+(s.running?'監聽中':'已停止')+'\nHA 測試開關實際狀態：'+state+' ｜ 新語音：'+s.new_voice_count+' ｜ HA 接受呼叫：'+s.ha_test_count;
+    box.style.whiteSpace='pre-line';
+  }catch(e){box.textContent='測試狀態暫時無法讀取'}
+}
+async function startClockHelperTest(){
+  const a=document.getElementById('xiaomi-alert');
+  showAlert(a,'warn','正在啟動 HA 虛擬開關測試，請稍候…');
+  try{
+    const r=await fetch('/api/clock/test-helper/start',{method:'POST'});const d=await r.json();
+    showAlert(a,d.ok?'ok':'err',d.msg||'測試未啟動');
+    if(d.ok)await loadConfig();
+    await refreshClockTestState();
+  }catch(e){showAlert(a,'err','測試模式啟動未完成，請重試')}
 }
 
 function escAttr(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;')}

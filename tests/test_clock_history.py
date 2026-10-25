@@ -101,9 +101,10 @@ class ClockHistoryTests(unittest.IsolatedAsyncioTestCase):
             if calls>=2:bridge.bridge_state['running']=False
             return {'ret':{'records':[
                 {'speaker':'User','content':'打开桥接测试','time':now-1},
-                {'speaker':'User','content':'打开桥接测试','time':now+1},
+                {'speaker':'User','content':'打开测试开关','time':now+1},
                 {'speaker':'User','content':'打开实际设备','time':now+2},
-                {'speaker':'Assistant','content':'关闭桥接测试','time':now+3}]}}
+                {'speaker':'User','content':'关闭测试开关','time':now+3},
+                {'speaker':'Assistant','content':'打开测试开关','time':now+4}]}}
         io.miio_request.side_effect=fetch
         account=MagicMock();account.login=AsyncMock(return_value=True)
         ha=MagicMock();ha.test_connection=AsyncMock(return_value=True);ha.call_service=AsyncMock(return_value=True)
@@ -111,6 +112,6 @@ class ClockHistoryTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(bridge,'CONFIG_PATH',Path(folder)/'config.yaml'), patch.object(bridge,'load_config',return_value=cfg), patch.object(bridge,'_has_xiaomi_credentials',return_value=True), patch.object(bridge,'_set_token'), patch.object(bridge,'MiAccount',return_value=account), patch.object(bridge,'HAClient',return_value=ha), patch('miservice.MiIOService',return_value=io), patch.object(bridge.time,'time',return_value=now/1000), patch.object(bridge.asyncio,'sleep',new=AsyncMock()):
                 bridge.bridge_state['running']=True
                 await bridge.bridge_loop()
-        self.assertEqual(ha.call_service.await_count,1)
-        self.assertEqual(ha.call_service.call_args.args[:3],('input_boolean','turn_on',{'entity_id':entity}))
-        self.assertEqual(bridge.bridge_state['clock_profile']['ha_test_count'],1)
+        self.assertEqual(ha.call_service.await_count,2)
+        self.assertEqual([c.args[:3] for c in ha.call_service.call_args_list],[('input_boolean','turn_on',{'entity_id':entity}),('input_boolean','turn_off',{'entity_id':entity})])
+        self.assertEqual(bridge.bridge_state['clock_profile']['ha_test_count'],2)

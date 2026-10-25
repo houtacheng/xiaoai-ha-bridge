@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1-ai01zm-experimental.5"
+VERSION = "3.12.1-ai01zm-experimental.6"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -47,6 +47,7 @@ COOKIE_TEMPLATE = "deviceId={device_id}; serviceToken={service_token}; userId={u
 # QR 扫码登录状态
 _qr_state: dict = {}
 _qr_flow_lock = asyncio.Lock()
+_clock_mode_lock = asyncio.Lock()
 
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -712,6 +713,7 @@ async def bridge_loop():
             mi_cfg["tts_reply"] = False
             last_timestamp[device_id] = max(last_timestamp.get(device_id, 0), int(time.time() * 1000))
             bridge_state["clock_profile"] = {"model": "zimi.clock.myk01", "dry_run": clock_dry_run,
+                                              "test_only": bool(mi_cfg.get("clock_bridge_test_only", False)),
                                               "new_voice_count": 0, "last_voice_time": None, "ha_test_count": 0}
             log.info("AI01ZM 米家對話路徑已選定 | dry_run=%s | TTS 尚未驗證", clock_dry_run)
         else:
@@ -929,7 +931,9 @@ async def bridge_loop():
                             phrase = re.sub(r"[\s，,。.!！?？]", "", query)
                             phrase = re.sub(r"^(小爱同学|小愛同學)", "", phrase)
                             service = {"打开桥接测试": "turn_on", "打開橋接測試": "turn_on",
-                                       "关闭桥接测试": "turn_off", "關閉橋接測試": "turn_off"}.get(phrase)
+                                       "关闭桥接测试": "turn_off", "關閉橋接測試": "turn_off",
+                                       "打开测试开关": "turn_on", "打開測試開關": "turn_on",
+                                       "关闭测试开关": "turn_off", "關閉測試開關": "turn_off"}.get(phrase)
                             if service:
                                 ok = await ha.call_service("input_boolean", service, {"entity_id": entity}, _bridge_session)
                                 state["ha_test_count"] += int(ok)
@@ -1799,31 +1803,107 @@ async def clock_diagnostics():
                 "voice_control_verified": False}
 
 
+async def _restart_clock_configuration(cfg):
+    previous_task = _bridge_task
+    await stop_bridge()
+    if previous_task and not previous_task.done():
+        try:
+            await previous_task
+        except asyncio.CancelledError:
+            pass
+    save_config(cfg)
+    bridge_state.pop("clock_profile", None)
+    await start_bridge()
+
+
+async def _clock_helper_state(cfg):
+    mi = cfg.get("xiaomi", {})
+    entity = mi.get("clock_test_entity", "")
+    if not re.fullmatch(r"input_boolean\.xiaoai_ai01zm_bridge_test[a-z0-9_]*", entity):
+        return None
+    ha = cfg.get("homeassistant", {})
+    if not ha.get("url") or not ha.get("token"):
+        return None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with session.get(ha["url"].rstrip("/") + "/api/states/" + entity,
+                               headers={"Authorization": "Bearer " + ha["token"]}) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json()
+    if payload.get("entity_id") != entity or payload.get("state") not in ("on", "off"):
+        return None
+    return payload["state"]
+
+
+async def _wait_clock_test_ready():
+    for _ in range(60):
+        profile = bridge_state.get("clock_profile") or {}
+        if (bridge_state.get("running") and bridge_state.get("connected")
+                and profile.get("dry_run") is False and profile.get("test_only") is True):
+            return True
+        if bridge_state.get("error"):
+            return False
+        await asyncio.sleep(0.25)
+    return False
+
+
+@app.get("/api/clock/test-state")
+async def clock_test_state():
+    cfg = load_config()
+    mi = cfg.get("xiaomi", {})
+    profile = bridge_state.get("clock_profile") or {}
+    dry_run = profile.get("dry_run", mi.get("clock_bridge_dry_run", True))
+    test_only = profile.get("test_only", mi.get("clock_bridge_test_only", False))
+    result = {"mode": "receive_only" if dry_run else "test_helper" if test_only else "rules",
+              "running": bool(bridge_state.get("running")),
+              "new_voice_count": profile.get("new_voice_count", 0),
+              "ha_test_count": profile.get("ha_test_count", 0),
+              "helper_state": None}
+    try:
+        result["helper_state"] = await _clock_helper_state(cfg)
+    except Exception as e:
+        result["error_type"] = type(e).__name__
+    return result
+
+
+@app.post("/api/clock/test-helper/start")
+async def start_clock_helper_test():
+    async with _clock_mode_lock:
+        cfg = load_config()
+        mi = cfg.setdefault("xiaomi", {})
+        if mi.get("conversation_api") != "mijia_aivs" or not mi.get("clock_did"):
+            return {"ok": False, "msg": "請先選定在線 AI01ZM"}
+        try:
+            if await _clock_helper_state(cfg) is None:
+                return {"ok": False, "msg": "專用 HA 測試開關無法讀取，尚未切換模式"}
+            mi.update(clock_bridge_dry_run=False, clock_bridge_test_only=True, tts_reply=False)
+            cfg["interrupt_native_reply"] = False
+            await _restart_clock_configuration(cfg)
+            if not await _wait_clock_test_ready():
+                return {"ok": False, "msg": "測試模式尚未就緒，請檢查連線狀態"}
+            return {"ok": True, "mode": "test_helper", "msg": "HA 虛擬開關測試已就緒，請說「打開測試開關」"}
+        except Exception as e:
+            return {"ok": False, "msg": "測試模式啟動未完成", "error_type": type(e).__name__}
+
+
 @app.post("/api/clock/prepare")
 async def prepare_clock_bridge():
     from miservice import MiIOService
     from clock_profile import select_clock
-    cfg = load_config()
-    mi = cfg.setdefault("xiaomi", {})
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            account = MiAccount(session, mi.get("username") or "", mi.get("password") or "", None)
-            _set_token(account, cfg)
-            target = select_clock(await MiIOService(account, region=mi.get("region", "cn")).device_list(name="full"), mi.get("clock_did", ""))
-        previous_task = _bridge_task
-        await stop_bridge()
-        if previous_task and not previous_task.done():
-            try:
-                await previous_task
-            except asyncio.CancelledError:
-                pass
-        mi.update(clock_did=str(target["did"]), conversation_api="mijia_aivs", clock_bridge_dry_run=True, tts_reply=False)
-        cfg["interrupt_native_reply"] = False
-        save_config(cfg)
-        await start_bridge()
-        return {"ok": True, "dry_run": True, "msg": "已選定 AI01ZM，僅監聽啟動後的新語音，不執行 HA 控制"}
-    except Exception as e:
-        return {"ok": False, "msg": "無法唯一選定在線 AI01ZM", "error_type": type(e).__name__}
+    async with _clock_mode_lock:
+        cfg = load_config()
+        mi = cfg.setdefault("xiaomi", {})
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                account = MiAccount(session, mi.get("username") or "", mi.get("password") or "", None)
+                _set_token(account, cfg)
+                target = select_clock(await MiIOService(account, region=mi.get("region", "cn")).device_list(name="full"), mi.get("clock_did", ""))
+            mi.update(clock_did=str(target["did"]), conversation_api="mijia_aivs", clock_bridge_dry_run=True, tts_reply=False)
+            cfg["interrupt_native_reply"] = False
+            await _restart_clock_configuration(cfg)
+            return {"ok": True, "dry_run": True, "msg": "僅收音模式已啟動；收到語音也不會呼叫 HA"}
+        except Exception as e:
+            return {"ok": False, "msg": "無法唯一選定在線 AI01ZM", "error_type": type(e).__name__}
 
 
 # ──────────────── HA 设备列表 ────────────────
