@@ -124,7 +124,7 @@ class ClockTests(unittest.IsolatedAsyncioTestCase):
             masked = await bridge.get_config()
         self.assertEqual(masked["xiaomi"]["cookie_text"], "••••••••")
         with patch.object(bridge, "load_config", return_value={"xiaomi": {"cookie_text": "serviceToken=synthetic"}}), patch.object(bridge, "save_config") as save:
-            await bridge.post_config(bridge.SaveConfigRequest(config=masked))
+            await bridge.post_config(bridge.SaveConfigRequest(config=masked,section="xiaomi",revision=masked["_config_revision"]))
             self.assertEqual(save.call_args.args[0]["xiaomi"]["cookie_text"], "serviceToken=synthetic")
 
     async def test_login_keeps_tls_verification_enabled(self):

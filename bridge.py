@@ -32,9 +32,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from config_updates import config_revision, merge_update
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1-ai01zm-experimental.6"
+VERSION = "3.12.1-ai01zm-experimental.7"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -265,8 +266,17 @@ class IntentParser:
     def parse(self, text: str) -> dict | None:
         text = text.strip()
         for rule in self.rules:
-            pattern = rule["pattern"].replace("{num}", r"(\d+)")
-            m = re.search(pattern, text, re.IGNORECASE)
+            raw_pattern = rule.get("pattern", "")
+            if not isinstance(raw_pattern, str) or not raw_pattern.strip():
+                continue
+            pattern = raw_pattern.replace("{num}", r"(\d+)")
+            try:
+                compiled = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                continue
+            if compiled.search(""):
+                continue
+            m = compiled.search(text)
             if m:
                 action = dict(rule["action"])
                 groups = m.groups()
@@ -1002,7 +1012,7 @@ async def bridge_loop():
                     # ── 解析指令（正则 → AI） ──
                     diag: dict = {}
                     actions = await _parse_and_resolve_actions(
-                        query, parser, rt_cfg, device_id=device_id, diag=diag)
+                        query, IntentParser(rt_cfg.get("intent_rules", [])), rt_cfg, device_id=device_id, diag=diag)
 
                     # 信息不足 → 反问，并记下待答状态
                     if diag.get("clarify"):
@@ -1526,6 +1536,7 @@ async def get_version():
 @app.get("/api/config")
 async def get_config():
     cfg = load_config()
+    cfg["_config_revision"] = config_revision(cfg)
     # 脱敏
     if cfg.get("xiaomi", {}).get("cookie_text"):
         cfg["xiaomi"]["cookie_text"] = "••••••••"
@@ -1544,12 +1555,24 @@ async def get_config():
 
 class SaveConfigRequest(BaseModel):
     config: dict[str, Any]
+    section: str = ""
+    revision: str = ""
 
 
 @app.post("/api/config")
 async def post_config(req: SaveConfigRequest):
-    cfg = req.config
     existing = load_config()
+    try:
+        cfg = merge_update(existing, req.config, req.section, req.revision)
+    except ValueError as error:
+        reason = str(error)
+        messages = {"stale_config": "設定已在其他頁面更新，請重新整理後再儲存；本次沒有覆蓋設定",
+                    "invalid_section": "此頁面版本過舊，請重新整理後再儲存",
+                    "empty_rule": "規則比對文字不能空白，請填寫或刪除該規則",
+                    "invalid_regex": "規則比對格式有誤，請修正後再儲存",
+                    "empty_matching_rule": "規則不可配對空白文字，請使用明確指令"}
+        return JSONResponse({"ok": False, "msg": messages.get(reason, "設定未儲存")},
+                            status_code=409 if reason == "stale_config" else 400)
     # 脱敏字段保留原值
     masked = "••••••••"
     if cfg.get("xiaomi", {}).get("cookie_text") == masked:
@@ -1571,7 +1594,7 @@ async def post_config(req: SaveConfigRequest):
         return JSONResponse({"ok": False, "msg": "启用面板访问保护前必须设置密码"}, status_code=400)
     save_config(cfg)
     log.info("配置已保存")
-    return {"ok": True}
+    return {"ok": True, "revision": config_revision(cfg)}
 
 
 @app.post("/api/bridge/start")
