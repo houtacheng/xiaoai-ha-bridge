@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # ──────────────── 常量 ────────────────
-VERSION = "3.12.1-ai01zm-experimental.3"
+VERSION = "3.12.1-ai01zm-experimental.4"
 CONFIG_PATH = Path("config/config.yaml")
 LOG_PATH = Path("logs/bridge.log")
 TOKEN_PATH = Path("config/.mi.token")
@@ -1721,6 +1721,26 @@ async def test_xiaomi(req: TestXiaomiRequest):
     except Exception as e:
         log.exception("test_xiaomi 异常: %s", e)
         return {"ok": False, "msg": f"请求失败: {type(e).__name__}"}
+
+
+@app.get("/api/clock/diagnostics")
+async def clock_diagnostics():
+    """Exact AI01ZM profile: read legacy clock status, never route voice or write settings."""
+    from miservice import MiIOService
+    from clock_profile import read_clock_status
+    cfg = load_config()
+    mi = cfg.get("xiaomi", {})
+    if not _has_xiaomi_credentials(cfg):
+        return {"ok": False, "msg": "請先登入小米帳號", "voice_control_verified": False}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            account = MiAccount(session, mi.get("username") or "", mi.get("password") or "", None)
+            _set_token(account, cfg)
+            io = MiIOService(account, region=mi.get("region", "cn"))
+            return await asyncio.wait_for(read_clock_status(io), timeout=60)
+    except Exception as e:
+        return {"ok": False, "msg": "鬧鐘狀態讀取未完成", "error_type": type(e).__name__,
+                "voice_control_verified": False}
 
 
 # ──────────────── HA 设备列表 ────────────────

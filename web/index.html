@@ -753,6 +753,7 @@ body{
         <div class="input-row">
           <button class="btn btn-primary" onclick="qrLogin()">&#128247;生成二维码</button>
           <button class="btn" onclick="searchDevices()">&#128269;搜索设备</button>
+          <button class="btn" onclick="diagnoseClock()">&#128336;偵測 AI01ZM 鬧鐘</button>
         </div>
         <div style="font-size:12px;color:var(--txt-muted);margin-top:8px">
           已登录时点<b style="color:var(--txt-secondary)">搜索设备</b>即可拉取账号下的小爱音箱，点选后填入下方「设备参数」。
@@ -763,6 +764,7 @@ body{
           <div style="margin-top:6px;font-size:11px;color:var(--txt-dim)" id="qr-status"></div>
         </div>
       </div>
+      <div id="mi-clock-result" class="card" style="display:none"></div>
       <div id="mi-device-list" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#9670;</span>发现设备 <span id="mi-device-count" style="text-transform:none;font-weight:400;font-size:10px"></span></div></div><div id="mi-devices"></div></div>
       <div class="card">
         <div class="card-head"><div class="card-title"><span>&#9881;</span>设备参数</div></div>
@@ -1215,12 +1217,30 @@ async function searchDevices(){
     if(d.ok){
       showAlert(a,'ok','✓ '+(d.msg||'获取成功'));
       if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
-      else showAlert(a,'warn','⚠ MiNA 清单未返回设备；米家可见不代表 MiNA 提供该设备，请查看安全诊断结果');
+      else {showAlert(a,'warn','⚠ MiNA 未列出設備，正在檢查 AI01ZM 的米家連線…');await diagnoseClock()}
     }else{
       showAlert(a,'err','✗ '+(d.msg||'获取失败')+' —— 若登录已失效，请重新扫码');
     }
   }catch(e){showAlert(a,'err','✗ '+e.message)}
 }
+async function diagnoseClock(){
+  const box=document.getElementById('mi-clock-result');
+  box.style.display='';box.textContent='正在讀取智能鬧鐘狀態，不會修改設定…';
+  try{
+    const response=await fetch('/api/clock/diagnostics');
+    const data=await response.json();
+    if(!data.ok){box.textContent=data.msg||'鬧鐘狀態讀取未完成';return}
+    if(!data.clocks||!data.clocks.length){box.textContent='此米家區域未找到 AI01ZM / zimi.clock.myk01';return}
+    box.innerHTML='<div class="card-head"><div class="card-title">AI01ZM 智能鬧鐘 · 唯讀狀態</div></div>'+data.clocks.map(clock=>{
+      const checks=clock.checks||{};
+      const volume=checks.volume&&checks.volume.status==='ok'?String(checks.volume.value):'未讀取';
+      const system=checks.hourly_system&&checks.hourly_system.status==='ok'?checks.hourly_system.value+' 小時制':'未讀取';
+      const state=clock.status==='read_only_verified'?'已連線，狀態讀取通過':clock.online===false?'離線':'已辨識，狀態尚未完整讀取';
+      return '<div class="rule-item"><b>'+escHtml(clock.name||'小愛智能鬧鐘')+'</b><div>'+escHtml(clock.model)+' · '+escHtml(state)+'</div><div>音量：'+escHtml(volume)+' · '+escHtml(system)+'</div></div>';
+    }).join('')+'<div style="margin-top:12px;color:var(--txt-muted)">已辨識米家鬧鐘；語音控制 HA 與 TTS 尚未驗證。這些紀錄不會填入 MiNA 設備 ID。</div>';
+  }catch(e){box.textContent='讀取暫時失敗，請稍後重試'}
+}
+
 function escAttr(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;')}
 
 // ═══════════ Test HA ═══════════
